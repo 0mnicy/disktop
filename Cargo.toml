@@ -1,0 +1,17 @@
+[package]
+name = "disktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A top-style terminal monitor for your drives, with live I/O graphs"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0mnicy/disktop"
+keywords = ["disk", "io", "monitor", "tui", "top"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+ratatui = "0.30.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk"] }
