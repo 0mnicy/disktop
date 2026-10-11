@@ -119,6 +119,20 @@ impl Path {
         (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
     }
 
+    /// Which way the path runs `s` cells from the start: the step from the
+    /// start of that segment to its end.
+    pub fn heading(&self, s: f64) -> Point {
+        if self.points.len() < 2 {
+            return (0.0, 0.0);
+        }
+        let i = self
+            .distances
+            .partition_point(|&d| d < s)
+            .clamp(1, self.points.len() - 1);
+        let (a, b) = (self.points[i - 1], self.points[i]);
+        (b.0 - a.0, b.1 - a.1)
+    }
+
     #[cfg(test)]
     pub fn start(&self) -> Point {
         self.at(0.0)
@@ -173,22 +187,53 @@ impl RoutePaths {
     /// branches, `dot` picks the branch a moving dot takes; `None` returns
     /// every branch, for drawing the track.
     pub fn points_at(&self, s: f64, dot: Option<u64>) -> Vec<Point> {
+        self.headings_at(s, dot)
+            .into_iter()
+            .map(|(point, _)| point)
+            .collect()
+    }
+
+    /// Where the route begins: at each source disk, or at the source
+    /// panel's port.
+    pub fn starts(&self) -> Vec<Point> {
+        if self.sources.is_empty() {
+            vec![self.trunk.at(0.0)]
+        } else {
+            self.sources.iter().map(|p| p.at(0.0)).collect()
+        }
+    }
+
+    /// Where the route ends, at each target disk or at the target panel's
+    /// port, with which way it's heading there.
+    pub fn finishes(&self) -> Vec<(Point, Point)> {
+        let end = |p: &Path| (p.at(p.length()), p.heading(p.length()));
+        if self.targets.is_empty() {
+            vec![end(&self.trunk)]
+        } else {
+            self.targets.iter().map(end).collect()
+        }
+    }
+
+    /// Like [`RoutePaths::points_at`], with which way the route runs at
+    /// each point (see [`Path::heading`]).
+    pub fn headings_at(&self, s: f64, dot: Option<u64>) -> Vec<(Point, Point)> {
         let source = self.source_length();
         let trunk = self.trunk.length();
+        let on = |path: &Path, t: f64| (path.at(t), path.heading(t));
         if s < source {
             // Measure back from the port so every branch meets the trunk together.
             let before_port = source - s;
             branches(&self.sources, 1, dot)
                 .filter(|p| before_port <= p.length())
-                .map(|p| p.at(p.length() - before_port))
+                .map(|p| on(p, p.length() - before_port))
                 .collect()
         } else if s <= source + trunk {
-            vec![self.trunk.at(s - source)]
+            vec![on(&self.trunk, s - source)]
         } else {
             let after_port = s - source - trunk;
             branches(&self.targets, self.target_copies, dot)
                 .filter(|p| after_port <= p.length())
-                .map(|p| p.at(after_port))
+                .map(|p| on(p, after_port))
                 .collect()
         }
     }
@@ -646,6 +691,17 @@ mod tests {
         assert_eq!(path.at(1.5), (1.5, 0.0));
         assert_eq!(path.at(5.0), (3.0, 2.0));
         assert_eq!(path.at(99.0), (3.0, 4.0));
+    }
+
+    #[test]
+    fn heading_follows_each_segment() {
+        let path = Path::new(vec![(0.0, 0.0), (4.0, 0.0), (4.0, 3.0)]);
+        assert_eq!(path.heading(1.0), (4.0, 0.0));
+        assert_eq!(path.heading(5.0), (0.0, 3.0));
+        // Past either end, the nearest segment.
+        assert_eq!(path.heading(-1.0), (4.0, 0.0));
+        assert_eq!(path.heading(99.0), (0.0, 3.0));
+        assert_eq!(Path::new(vec![(1.0, 1.0)]).heading(0.0), (0.0, 0.0));
     }
 
     #[test]

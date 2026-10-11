@@ -10,6 +10,11 @@
 //! Positions are distances in cells along a route; the UI maps them to the
 //! screen with the current layout. When a flow stops, its dots keep going
 //! until they reach the end, so a stream drains out instead of vanishing.
+//!
+//! Flows can be drawn as dashed arrows instead (see [`FlowStyle`]): an
+//! evenly dashed line whose dashes march from source to target, all at one
+//! steady speed so every flow reads the same way. The dots still run
+//! underneath, unseen, to say how far the line has grown or drained.
 
 use std::collections::VecDeque;
 
@@ -17,10 +22,16 @@ use crate::model::Flow;
 
 /// How fast every dot moves, in cells per second.
 pub const SPEED: f64 = 16.0;
+/// How fast a dashed line's dashes march, in cells per second: slow enough
+/// to follow by eye, and the same for every flow.
+pub const MARCH_SPEED: f64 = 8.0;
 /// The automatic scale keeps the busiest flow's dots per second in this
 /// band, and only changes when it drifts out, so the scale doesn't flicker.
-const BUSIEST_MIN_DOTS: f64 = 6.0;
-const BUSIEST_MAX_DOTS: f64 = 24.0;
+/// At [`SPEED`] that puts its dots 2 to 5 cells apart. Closer than about
+/// twice the distance a dot moves in a frame, evenly spaced dots seem to
+/// jump backwards, like wagon wheels on film.
+const BUSIEST_MIN_DOTS: f64 = 3.0;
+const BUSIEST_MAX_DOTS: f64 = 7.5;
 /// The automatic scale before any flow has been seen.
 const DEFAULT_DOT_SIZE: f64 = 1024.0 * 1024.0;
 /// Most dots one route emits per step, so a tiny fixed dot size on a fast
@@ -28,6 +39,33 @@ const DEFAULT_DOT_SIZE: f64 = 1024.0 * 1024.0;
 const MAX_DOTS_PER_STEP: usize = 200;
 /// Dots never travel farther than this, even if a route's length is unknown.
 const MAX_DISTANCE: f64 = 2000.0;
+
+/// How flows are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum FlowStyle {
+    /// Small dots, packed closely.
+    #[default]
+    Dots,
+    /// A marching dashed line from a dot at the source to an arrowhead at
+    /// the target.
+    Arrows,
+}
+
+impl FlowStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dots => "dots",
+            Self::Arrows => "arrows",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Dots => Self::Arrows,
+            Self::Arrows => Self::Dots,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Dot {
@@ -53,6 +91,10 @@ pub struct Route {
     dots: VecDeque<Dot>,
     /// Bytes moved since the last dot was emitted.
     pending: f64,
+    /// How far a dashed line's dashes have marched, in cells.
+    marched: f64,
+    /// True once a dot has reached the end, so the stream spans the route.
+    arrived: bool,
     next_id: u64,
     /// Route length on screen at the last frame.
     length: Option<f64>,
@@ -63,9 +105,20 @@ impl Route {
         self.dots.iter()
     }
 
-    /// How far the leading dot has got.
+    /// How far the stream has got: the leading dot, or all the way once a
+    /// dot has arrived, even if the next one is still far behind.
     pub fn head(&self) -> f64 {
-        self.dots.front().map_or(0.0, |d| d.distance)
+        if self.arrived {
+            f64::INFINITY
+        } else {
+            self.dots.front().map_or(0.0, |d| d.distance)
+        }
+    }
+
+    /// How far a dashed line's dashes have marched since the route
+    /// started, in cells.
+    pub fn marched(&self) -> f64 {
+        self.marched
     }
 
     /// Where the stream begins: the start while running, or the last dot while draining.
@@ -85,6 +138,7 @@ pub struct FlowField {
     dot_size: f64,
     /// True when the user set the dot size; otherwise it follows the flows.
     fixed: bool,
+    style: FlowStyle,
 }
 
 impl FlowField {
@@ -95,7 +149,16 @@ impl FlowField {
             routes: Vec::new(),
             dot_size: dot_size.unwrap_or(DEFAULT_DOT_SIZE),
             fixed: dot_size.is_some(),
+            style: FlowStyle::default(),
         }
+    }
+
+    pub fn style(&self) -> FlowStyle {
+        self.style
+    }
+
+    pub fn set_style(&mut self, style: FlowStyle) {
+        self.style = style;
     }
 
     pub fn routes(&self) -> &[Route] {
@@ -145,6 +208,8 @@ impl FlowField {
                         dots: VecDeque::new(),
                         // A full dot's worth, so the first one appears straight away.
                         pending: self.dot_size,
+                        marched: 0.0,
+                        arrived: false,
                         next_id: 0,
                         length: None,
                     });
@@ -172,6 +237,7 @@ impl FlowField {
             for dot in &mut route.dots {
                 dot.distance += SPEED * dt;
             }
+            route.marched += MARCH_SPEED * dt;
             if route.running && route.rate > 0.0 {
                 route.pending += route.rate * dt;
                 let mut emitted = 0;
@@ -193,6 +259,7 @@ impl FlowField {
             let end = route.length.unwrap_or(MAX_DISTANCE).min(MAX_DISTANCE);
             while route.dots.front().is_some_and(|d| d.distance > end) {
                 route.dots.pop_front();
+                route.arrived = true;
             }
         }
         self.prune();
@@ -304,6 +371,16 @@ mod tests {
     }
 
     #[test]
+    fn dashes_march_at_one_speed_whatever_the_rate() {
+        let mut field = FlowField::new(Some(MIB));
+        field.sync(&[flow("a", "b", 1.0), flow("c", "d", 500.0)]);
+        run(&mut field, 2.0);
+        for route in field.routes() {
+            assert!((route.marched() - 2.0 * MARCH_SPEED).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn dots_are_evenly_spaced_by_rate() {
         let mut field = FlowField::new(Some(MIB));
         field.sync(&[flow("a", "b", 8.0)]);
@@ -327,9 +404,9 @@ mod tests {
             ]);
             field.dot_size()
         };
-        assert_eq!(size_for(600.0), 50.0 * MIB, "12 dots/s");
-        assert_eq!(size_for(1.6 * 1024.0), 100.0 * MIB, "16 dots/s");
-        assert_eq!(size_for(40.0), 2.0 * MIB, "20 dots/s");
+        assert_eq!(size_for(600.0), 100.0 * MIB, "6 dots/s");
+        assert_eq!(size_for(1.6 * 1024.0), 500.0 * MIB, "3.3 dots/s");
+        assert_eq!(size_for(40.0), 10.0 * MIB, "4 dots/s");
         assert_eq!(size_for(0.001), KIB, "nothing smaller than 1 KiB");
     }
 
@@ -337,17 +414,17 @@ mod tests {
     fn automatic_scale_holds_steady_for_small_changes() {
         let mut field = FlowField::new(None);
         field.sync(&[flow("a", "b", 600.0)]);
-        assert_eq!(field.dot_size(), 50.0 * MIB);
-        field.sync(&[flow("a", "b", 1000.0)]);
+        assert_eq!(field.dot_size(), 100.0 * MIB);
+        field.sync(&[flow("a", "b", 700.0)]);
         assert_eq!(
             field.dot_size(),
-            50.0 * MIB,
-            "20 dots/s is still in the band"
+            100.0 * MIB,
+            "7 dots/s is still in the band"
         );
-        field.sync(&[flow("a", "b", 1300.0)]);
-        assert_eq!(field.dot_size(), 100.0 * MIB, "26 dots/s is too many");
+        field.sync(&[flow("a", "b", 800.0)]);
+        assert_eq!(field.dot_size(), 200.0 * MIB, "8 dots/s is too many");
         field.sync(&[]);
-        assert_eq!(field.dot_size(), 100.0 * MIB, "no flows, no change");
+        assert_eq!(field.dot_size(), 200.0 * MIB, "no flows, no change");
     }
 
     #[test]
@@ -388,7 +465,22 @@ mod tests {
         field.set_lengths(&[Some(10.0)]);
         run(&mut field, 3.0);
         assert!(field.routes()[0].dots().all(|d| d.distance <= 10.0));
-        assert!(field.routes()[0].head() <= 10.0);
+    }
+
+    #[test]
+    fn a_stream_reaches_the_end_and_stays_there() {
+        // One dot every 4 seconds, on a 20-cell route the first crosses in 1.25.
+        let mut field = FlowField::new(Some(MIB));
+        field.sync(&[flow("a", "b", 0.25)]);
+        field.set_lengths(&[Some(20.0)]);
+        run(&mut field, 1.0);
+        assert!(field.routes()[0].head() < 20.0);
+        run(&mut field, 1.0);
+        assert!(
+            field.routes()[0].dots().next().is_none(),
+            "the dot has arrived"
+        );
+        assert_eq!(field.routes()[0].head(), f64::INFINITY);
     }
 
     #[test]

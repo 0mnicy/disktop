@@ -24,6 +24,7 @@ use clap::Parser;
 use crate::app::App;
 use crate::demo::Demo;
 use crate::drives::DriveMonitor;
+use crate::flows::FlowStyle;
 use crate::model::Source;
 
 /// A top-style terminal monitor for your drives.
@@ -43,8 +44,13 @@ struct Args {
     #[arg(long)]
     demo: bool,
 
-    /// How much data each flow dot stands for, such as 1M or 512K (binary
-    /// units). By default it adjusts to the busiest flow.
+    /// How to draw data moving between drives. Press `a` to switch while
+    /// running.
+    #[arg(long, value_enum, default_value_t = FlowStyle::Dots)]
+    style: FlowStyle,
+
+    /// How much data each flow dot or arrow stands for, such as 1M or 512K
+    /// (binary units). By default it adjusts to the busiest flow.
     #[arg(long, value_name = "SIZE", value_parser = format::parse_size)]
     dot_size: Option<f64>,
 
@@ -71,5 +77,6 @@ fn main() -> Result<()> {
         args.dot_size,
         args.fps,
     );
+    app.field.set_style(args.style);
     ratatui::run(|terminal| app.run(terminal))
 }

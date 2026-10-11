@@ -135,6 +135,7 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Char('f') => self.show_flows = !self.show_flows,
+            KeyCode::Char('a') => self.field.set_style(self.field.style().toggled()),
             KeyCode::Char('p') | KeyCode::Char(' ') => self.paused = !self.paused,
             _ => {}
         }

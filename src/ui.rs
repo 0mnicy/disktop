@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::symbols::{self, Marker};
@@ -7,7 +10,7 @@ use ratatui::widgets::canvas::{Canvas, Points};
 use ratatui::widgets::{Axis, Block, BorderType, Chart, Dataset, GraphType, LineGauge, Paragraph};
 
 use crate::app::App;
-use crate::flows::{FlowField, Route};
+use crate::flows::{Dot, FlowField, FlowStyle, Route};
 use crate::format;
 use crate::layout::{self, Board, Panel, Point, RouteEnds};
 use crate::model::{self, ArrayLayout, Group, GroupKind, History, Member, Rate};
@@ -37,10 +40,36 @@ const MAX_LISTED_FLOWS: usize = 4;
 const MIN_BOXED_MEMBER_ROWS: u16 = 5;
 /// The flow list's route column is at least this wide, so it rarely changes.
 const MIN_ROUTE_WIDTH: usize = 28;
-/// Distance between the dots that draw a track, in cells.
-const TRACK_STEP: f64 = 0.5;
-/// How far behind each dot its tail sits, in cells.
-const DOT_TAIL: f64 = 0.5;
+/// Distance between the dots that draw a track, in cells: far enough apart
+/// that the track is dotted and a dot's solid tail stands out on it.
+const TRACK_STEP: f64 = 1.0;
+/// How long each dot's dim tail is, in cells, and how finely it's drawn.
+const DOT_TAIL: f64 = 1.5;
+const TAIL_STEP: f64 = 0.25;
+/// Arrowheads for each way a flow can run. From the old PC character set,
+/// so nearly every terminal font has them.
+const ARROW_RIGHT: char = '►';
+const ARROW_LEFT: char = '◄';
+const ARROW_UP: char = '▲';
+const ARROW_DOWN: char = '▼';
+/// Where a dashed arrow starts.
+const SOURCE_MARK: char = '●';
+/// A dashed arrow repeats every this many cells: a dash, then a gap.
+const DASH_PERIOD: f64 = 3.0;
+const DASH_LENGTH: f64 = 2.0;
+/// How finely dashes are traced along a route, in cells: fine enough to
+/// catch every half cell.
+const DASH_STEP: f64 = 0.25;
+/// Halves of a cell a line can cover, from its middle out to each edge.
+const UP: u8 = 1;
+const DOWN: u8 = 2;
+const LEFT: u8 = 4;
+const RIGHT: u8 = 8;
+/// A thin line through the halves of a cell, indexed by those halves, with
+/// rounded corners like the panels'.
+const LINES: [char; 16] = [
+    ' ', '╵', '╷', '│', '╴', '╯', '╮', '┤', '╶', '╰', '╭', '├', '─', '┴', '┬', '┼',
+];
 
 /// The graph's y-axis never shrinks below this, so an idle drive draws a flat
 /// line instead of magnifying a few bytes of noise.
@@ -85,7 +114,10 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
 
     let plans = plan_routes(&board, &app.field, groups);
     if app.show_flows {
-        draw_flows(frame, body, &app.field, &plans);
+        match app.field.style() {
+            FlowStyle::Dots => draw_dots(frame, body, &app.field, &plans),
+            FlowStyle::Arrows => draw_arrows(frame.buffer_mut(), body, &app.field, &plans),
+        }
         draw_flow_list(frame, flow_list, &listed, groups, &app.field);
     }
     plans
@@ -137,6 +169,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut keys = vec![" q".bold(), " quit   ".dark_gray()];
     keys.extend(["f".bold(), " flows   ".dark_gray()]);
+    // Names the style a press switches to.
+    let other = app.field.style().toggled().name();
+    keys.extend(["a".bold(), format!(" {other}   ").dark_gray()]);
     keys.extend(["p".bold(), " pause".dark_gray()]);
     frame.render_widget(Line::from(keys), area);
 
@@ -432,9 +467,10 @@ fn plan_routes(
     board.plan(&ends)
 }
 
-/// Draws each flow's track in a dim color and its dots in a bright one, on
-/// top of the panels.
-fn draw_flows(
+/// Draws each flow's track as a dim dotted line and its dots in a bright
+/// color, each trailing a short solid tail in the dim one, so it points the
+/// way it's going.
+fn draw_dots(
     frame: &mut Frame,
     body: Rect,
     field: &FlowField,
@@ -460,15 +496,10 @@ fn draw_flows(
         }
 
         for dot in route.dots() {
-            for distance in [dot.distance, dot.distance - DOT_TAIL] {
-                if distance >= 0.0 {
-                    dots[color].extend(
-                        plan.points_at(distance, Some(dot.id))
-                            .into_iter()
-                            .map(to_canvas),
-                    );
-                }
-            }
+            let (head, tail) = comet(plan, dot);
+            dots[color].extend(head.into_iter().map(to_canvas));
+            // The tail is drawn with the track, in the dim color.
+            tracks[color].extend(tail.into_iter().map(to_canvas));
         }
     }
 
@@ -483,7 +514,7 @@ fn draw_flows(
                     color: *color,
                 });
             }
-            // Dots go on their own layer so they replace the track under them.
+            // Heads go on their own layer so they replace what's under them.
             ctx.layer();
             for (color, coords) in DOT_COLORS.iter().zip(&dots) {
                 ctx.draw(&Points {
@@ -493,6 +524,145 @@ fn draw_flows(
             }
         });
     frame.render_widget(canvas, body);
+}
+
+/// Draws each flow as a dashed line from a dot where the data leaves to an
+/// arrowhead where it arrives, in line characters half a cell at a time.
+/// The dashes march toward the arrowhead, every flow at the same speed, and
+/// each dash is bright at the front and dim at the back, so it points the
+/// way it's going.
+fn draw_arrows(
+    buffer: &mut Buffer,
+    body: Rect,
+    field: &FlowField,
+    plans: &[Option<layout::RoutePaths>],
+) {
+    for (route, plan) in field.routes().iter().zip(plans) {
+        let Some(plan) = plan else {
+            continue;
+        };
+        let color = route.color % DOT_COLORS.len();
+        let style = Style::new().fg(DOT_COLORS[color]);
+        let length = plan.length();
+        // Like the dots' track, the line grows out from the source as a
+        // copy starts and drains into the target when it ends.
+        let (start, end) = track_span(route, length);
+
+        // The halves of each cell the dashes cover, and whether a dash's
+        // front is in it.
+        let mut cells: HashMap<(u16, u16), (u8, bool)> = HashMap::new();
+        let mut s = (start / DASH_STEP).ceil() * DASH_STEP;
+        while s <= end {
+            // How far into its dash this point is, from the back.
+            let into_dash = (s - route.marched()).rem_euclid(DASH_PERIOD);
+            if into_dash < DASH_LENGTH {
+                for (point, heading) in plan.headings_at(s, None) {
+                    if let Some(cell) = cell_at(body, point) {
+                        let (halves, front) = cells.entry(cell).or_default();
+                        *halves |= half_of(point, heading);
+                        *front |= into_dash >= DASH_LENGTH / 2.0;
+                    }
+                }
+            }
+            s += DASH_STEP;
+        }
+        for (cell, (halves, front)) in cells {
+            let style = if front {
+                style.bold()
+            } else {
+                Style::new().fg(TRACK_COLORS[color])
+            };
+            buffer[cell]
+                .set_char(LINES[usize::from(halves)])
+                .set_style(style);
+        }
+
+        let mut mark = |point: Point, symbol: char| {
+            if let Some(cell) = cell_at(body, point) {
+                buffer[cell].set_char(symbol).set_style(style.bold());
+            }
+        };
+        if route.running {
+            for point in plan.starts() {
+                mark(point, SOURCE_MARK);
+            }
+        }
+        if end >= length {
+            for (point, heading) in plan.finishes() {
+                mark(point, arrowhead(heading));
+            }
+        }
+    }
+}
+
+/// The cell a point is in, if it's inside `area`.
+fn cell_at(area: Rect, (x, y): Point) -> Option<(u16, u16)> {
+    let (column, row) = (x.floor(), y.floor());
+    let inside = column >= f64::from(area.left())
+        && column < f64::from(area.right())
+        && row >= f64::from(area.top())
+        && row < f64::from(area.bottom());
+    inside.then_some((column as u16, row as u16))
+}
+
+/// Which half of its cell a line running along `heading` covers at `point`.
+/// A cell is about twice as tall as it is wide, so a step of one row counts
+/// as much as two columns.
+fn half_of((x, y): Point, (dx, dy): Point) -> u8 {
+    if dx.abs() >= dy.abs() * 2.0 {
+        if x - x.floor() < 0.5 { LEFT } else { RIGHT }
+    } else if y - y.floor() < 0.5 {
+        UP
+    } else {
+        DOWN
+    }
+}
+
+/// The arrowhead for a flow running along `heading`, a step in cells,
+/// judged the same way as [`half_of`].
+fn arrowhead((dx, dy): Point) -> char {
+    if dx.abs() >= dy.abs() * 2.0 {
+        if dx >= 0.0 { ARROW_RIGHT } else { ARROW_LEFT }
+    } else if dy > 0.0 {
+        ARROW_DOWN
+    } else {
+        ARROW_UP
+    }
+}
+
+/// The points that draw a dot: its head, the front half cell, and its tail
+/// behind that. The tail runs straight back and stops at the first bend,
+/// so on a route's short twisty legs, such as inside an array, it doesn't
+/// wrap around the corners into a lump.
+fn comet(plan: &layout::RoutePaths, dot: &Dot) -> (Vec<Point>, Vec<Point>) {
+    let fronts = plan.headings_at(dot.distance, Some(dot.id));
+    let straight_on = |heading: Point| fronts.iter().any(|&(_, front)| same_way(front, heading));
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    let mut behind = 0.0;
+    while behind <= DOT_TAIL && dot.distance - behind >= 0.0 {
+        let points: Vec<Point> = plan
+            .headings_at(dot.distance - behind, Some(dot.id))
+            .into_iter()
+            .filter(|&(_, heading)| straight_on(heading))
+            .map(|(point, _)| point)
+            .collect();
+        if points.is_empty() {
+            break;
+        }
+        if behind < 0.5 {
+            head.extend(points);
+        } else {
+            tail.extend(points);
+        }
+        behind += TAIL_STEP;
+    }
+    (head, tail)
+}
+
+/// Whether two headings point the same way.
+fn same_way((ax, ay): Point, (bx, by): Point) -> bool {
+    let lengths = ax.hypot(ay) * bx.hypot(by);
+    lengths > 0.0 && (ax * bx + ay * by) / lengths > 0.99
 }
 
 /// The stretch of a route to draw a track along.
@@ -576,10 +746,14 @@ fn draw_flow_list(
 
     // The scale, like the one on a map: what one dot stands for.
     let fixed = if field.is_fixed() { " (fixed)" } else { "" };
-    let scale = format!(
-        " flows · each dot is {}{fixed}",
-        format::size_label(field.dot_size())
-    );
+    let scale = match field.style() {
+        FlowStyle::Dots => format!(
+            " flows · each dot is {}{fixed}",
+            format::size_label(field.dot_size())
+        ),
+        // Dashes all march at one speed, so they have no scale.
+        FlowStyle::Arrows => " flows".to_string(),
+    };
     let mut lines = vec![Line::from(scale.dark_gray())];
     if flows.is_empty() {
         // The list keeps its space, so say why it's empty.
@@ -725,15 +899,102 @@ mod tests {
     }
 
     #[test]
+    fn arrows_are_dashed_lines_from_a_dot_to_an_arrowhead() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        let mut app = demo_app_at(10.0);
+        app.field.set_style(FlowStyle::Arrows);
+        // Long enough for every line to reach its target.
+        animate(&mut terminal, &mut app, 200);
+        let flow_cells: Vec<char> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| DOT_COLORS.contains(&cell.fg))
+            .filter_map(|cell| cell.symbol().chars().next())
+            .collect();
+        let count = |symbols: &[char]| flow_cells.iter().filter(|c| symbols.contains(c)).count();
+        assert!(count(&LINES[1..]) > 20, "{flow_cells:?}");
+        // Dashes are bright at the front and dim at the back.
+        let dashes = |colors: &[Color]| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| colors.contains(&cell.fg))
+                .filter(|cell| LINES[1..].iter().any(|&l| cell.symbol().starts_with(l)))
+                .count()
+        };
+        assert!(dashes(&DOT_COLORS) > 5 && dashes(&TRACK_COLORS) > 5);
+        assert!(count(&[SOURCE_MARK]) >= 2, "{flow_cells:?}");
+        assert!(
+            count(&[ARROW_RIGHT, ARROW_LEFT, ARROW_UP, ARROW_DOWN]) >= 2,
+            "{flow_cells:?}"
+        );
+        let lines = screen(&terminal);
+        assert!(!lines.iter().any(|l| l.contains("each dot is")));
+        assert!(lines.last().unwrap().contains("a dots"));
+    }
+
+    #[test]
+    fn dashes_cover_the_halves_of_each_cell_they_pass() {
+        let across = (1.0, 0.0);
+        let down = (0.0, 1.0);
+        assert_eq!(half_of((4.2, 7.5), across), LEFT);
+        assert_eq!(half_of((4.7, 7.5), across), RIGHT);
+        assert_eq!(half_of((4.5, 7.2), down), UP);
+        assert_eq!(half_of((4.5, 7.9), down), DOWN);
+        assert_eq!(LINES[usize::from(LEFT | RIGHT)], '─');
+        assert_eq!(LINES[usize::from(UP | DOWN)], '│');
+        assert_eq!(LINES[usize::from(UP | RIGHT)], '╰');
+        assert_eq!(LINES[usize::from(DOWN | LEFT)], '╮');
+    }
+
+    #[test]
+    fn dot_tails_stop_at_a_bend() {
+        // Right for 10 cells, then down for 10.
+        let plan = layout::RoutePaths {
+            sources: Vec::new(),
+            trunk: layout::Path::new(vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]),
+            targets: Vec::new(),
+            target_copies: 1,
+        };
+        let at = |distance| comet(&plan, &Dot { id: 0, distance });
+
+        // On a straight run, the whole tail.
+        let (head, tail) = at(5.0);
+        assert_eq!(head.len(), 2);
+        assert_eq!(tail.len(), 5);
+        assert!(tail.iter().all(|&(_, y)| y == 0.0));
+
+        // Just round the corner, only the part below it.
+        let (head, tail) = at(10.75);
+        assert!(!head.is_empty());
+        assert!(tail.iter().all(|&(x, y)| x == 10.0 && y > 0.0), "{tail:?}");
+        assert!(tail.len() < 5);
+    }
+
+    #[test]
+    fn arrowheads_follow_the_heading() {
+        assert_eq!(arrowhead((1.0, 0.0)), ARROW_RIGHT);
+        assert_eq!(arrowhead((-3.0, 0.5)), ARROW_LEFT);
+        assert_eq!(arrowhead((0.0, 2.0)), ARROW_DOWN);
+        assert_eq!(arrowhead((0.5, -1.0)), ARROW_UP);
+        // One row is about as far as two columns.
+        assert_eq!(arrowhead((1.9, 1.0)), ARROW_DOWN);
+    }
+
+    #[test]
     fn flow_list_shows_what_each_dot_stands_for() {
         let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
         animate(&mut terminal, &mut demo_app_at(10.0), 1);
         let lines = screen(&terminal);
-        // The busiest demo copy is about 600 MiB/s, which gets 50 MiB dots.
+        // The busiest demo copy is about 600 MiB/s, which gets 100 MiB dots.
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("flows · each dot is 50 MiB")),
+                .any(|l| l.contains("flows · each dot is 100 MiB")),
             "{:?}",
             lines.iter().find(|l| l.contains("flows"))
         );
@@ -779,7 +1040,8 @@ mod tests {
 #[cfg(test)]
 mod snapshot {
     /// Prints the demo as text. Run with
-    /// `cargo test print_demo -- --ignored --nocapture`.
+    /// `cargo test print_demo -- --ignored --nocapture`; COLS and ROWS set
+    /// the size, AT the second of the demo, and STYLE=arrows draws arrows.
     #[test]
     #[ignore]
     fn print_demo() {
@@ -792,6 +1054,9 @@ mod snapshot {
         let mut demo = crate::demo::Demo::new();
         demo.advance_to(var("AT", 23.0));
         let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1), None, 20);
+        if std::env::var("STYLE").is_ok_and(|style| style == "arrows") {
+            app.field.set_style(crate::flows::FlowStyle::Arrows);
+        }
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         animate(&mut terminal, &mut app, 120);
         print_screen(&terminal);

@@ -100,6 +100,7 @@ cargo run --release
 disktop                 # sample once a second
 disktop --interval 250  # sample every 250 ms (minimum 100)
 disktop --demo          # made-up arrays and copies, to see the flow view
+disktop --style arrows  # draw flows as arrows instead of dots
 disktop --dot-size 1M   # make every flow dot stand for 1 MiB
 disktop --fps 10        # fewer animation frames, for slow terminals
 ```
@@ -107,13 +108,15 @@ disktop --fps 10        # fewer animation frames, for slow terminals
 | Key | Action |
 | --- | --- |
 | `f` | Show or hide flows |
+| `a` | Switch between dots and arrows |
 | `p` or `Space` | Pause |
 | `q`, `Esc` or `Ctrl+C` | Quit |
 
 ### Reading the flow view
 
-Each copy between drives gets its own color, a dim track showing its route,
-and bright dots moving along it from source to destination. Every flow
+Each copy between drives gets its own color, a dim dotted track showing its
+route, and bright dots moving along it from source to destination. Each dot
+trails a short dim tail, so it points the way the data is going. Every flow
 leaves and enters a panel at its own point and runs in its own lane in the
 channel between the columns, so streams don't pile on top of each other.
 
@@ -123,6 +126,13 @@ scale on a map, and the list under the panels says how much (`each dot is
 dots is moving twice as much data. The amount is a round size picked so the
 busiest flow shows a readable number of dots; it only changes when the
 busiest flow speeds up or slows down a lot. Use `--dot-size` to fix it.
+
+With `--style arrows`, or after pressing `a`, each flow is drawn as a
+dashed arrow instead: a line of dashes from a dot where the data leaves to
+an arrowhead where it arrives. The dashes march toward the arrowhead, every
+flow at the same steady speed, and each dash is bright at the front and dim
+at the back, so it points the way it's going. How fast each flow is moving
+is in the list under the panels.
 
 Inside an array, each dot lands on as many disks as the array keeps copies:
 every disk for a classic mirror, two neighbouring disks at a time for btrfs
