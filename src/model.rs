@@ -190,6 +190,11 @@ pub trait Source {
     fn badge(&self) -> Option<&str> {
         None
     }
+
+    /// A caveat about which flows can be seen, shown in the footer.
+    fn flow_note(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]

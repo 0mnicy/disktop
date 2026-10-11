@@ -5,11 +5,13 @@ use std::time::Instant;
 use sysinfo::{Disk, DiskKind, Disks};
 
 use crate::model::{Flow, Group, GroupKind, History, Member, Rate, Source};
+use crate::procio::{DeviceGroups, ProcFlows};
 use crate::sysfs::{self, Btrfs};
 
 /// Where Linux exposes block devices and filesystems. Missing elsewhere,
 /// which simply means no arrays are found.
 const SYS: &str = "/sys";
+const PROC: &str = "/proc";
 const DISKSTATS: &str = "/proc/diskstats";
 
 /// Cumulative (bytes read, bytes written) counters, keyed by what they count.
@@ -30,26 +32,46 @@ const HIDDEN_FILE_SYSTEMS: [&str; 6] = [
 ///
 /// Each volume is a standalone group, except a btrfs filesystem spanning
 /// several disks on Linux, which becomes an array with a member per disk.
-/// No flows are reported yet.
+/// On Linux, copies between groups are traced from `/proc` as flows.
 pub struct DriveMonitor {
     disks: Disks,
     groups: Vec<Group>,
     /// Counters from the previous sample: by mount point for volumes, and
     /// by `disk:<name>` for array members.
     counters: Counters,
+    /// Which group each kernel block device belongs to.
+    devices: DeviceGroups,
+    tracer: ProcFlows,
+    flows: Vec<Flow>,
+    /// Shown in the footer when flows can't all be seen.
+    flow_note: Option<String>,
     last_sample: Instant,
 }
 
 impl DriveMonitor {
     pub fn new() -> Self {
         let disks = Disks::new_with_refreshed_list();
+        let tracer = ProcFlows::new(PROC);
+        let flow_note = if !Path::new(PROC).join("self/fdinfo").exists() {
+            Some("flows are traced on Linux only".to_string())
+        } else if !tracer.sees_everything() {
+            Some("flows: your processes only · run with sudo to see all".to_string())
+        } else {
+            None
+        };
         let mut monitor = Self {
             disks,
             groups: Vec::new(),
             counters: HashMap::new(),
+            devices: DeviceGroups::new(),
+            tracer,
+            flows: Vec::new(),
+            flow_note,
             last_sample: Instant::now(),
         };
         monitor.rebuild(None);
+        // Take a first reading so the next sample has something to compare.
+        monitor.tracer.sample(None, &monitor.devices);
         monitor
     }
 
@@ -61,6 +83,7 @@ impl DriveMonitor {
             .map(|g| (g.id.clone(), g))
             .collect();
         let mut counters = Counters::new();
+        let mut devices = DeviceGroups::new();
         let sample = Sample {
             elapsed_secs,
             previous: &self.counters,
@@ -122,6 +145,13 @@ impl DriveMonitor {
             let disk = &disks[index];
             let id = facts[index].mount.clone();
             let old = previous.remove(&id);
+            let group_devices = match facts[index].array {
+                Some(array) => arrays[array].devices.clone(),
+                None => facts[index].kernel.iter().cloned().collect(),
+            };
+            for device in group_devices {
+                devices.insert(device, id.clone());
+            }
             let mut group = match facts[index].array {
                 Some(array) => array_group(
                     disk,
@@ -149,6 +179,7 @@ impl DriveMonitor {
         }
 
         self.counters = counters;
+        self.devices = devices;
         self.groups.sort_by(|a, b| a.id.cmp(&b.id));
     }
 }
@@ -163,6 +194,7 @@ impl Source for DriveMonitor {
 
         self.disks.refresh(true);
         self.rebuild(Some(elapsed));
+        self.flows = self.tracer.sample(Some(elapsed), &self.devices);
     }
 
     fn groups(&self) -> &[Group] {
@@ -170,7 +202,11 @@ impl Source for DriveMonitor {
     }
 
     fn flows(&self) -> &[Flow] {
-        &[]
+        &self.flows
+    }
+
+    fn flow_note(&self) -> Option<&str> {
+        self.flow_note.as_deref()
     }
 }
 

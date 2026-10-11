@@ -141,12 +141,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     if app.paused {
         state.push("paused");
     }
-    if !state.is_empty() {
-        let line = Line::from(format!("{} ", state.join(" · ")))
-            .yellow()
-            .right_aligned();
-        frame.render_widget(line, area);
-    }
+    let line = if state.is_empty() {
+        // With nothing more pressing to say, say what limits the flows.
+        match app.source.flow_note() {
+            Some(note) => Line::from(format!("{note} ")).dark_gray(),
+            None => return,
+        }
+    } else {
+        Line::from(format!("{} ", state.join(" · "))).yellow()
+    };
+    frame.render_widget(line.right_aligned(), area);
 }
 
 fn draw_standalone(frame: &mut Frame, area: Rect, group: &Group) {

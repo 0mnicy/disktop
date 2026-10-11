@@ -5,6 +5,7 @@ mod flows;
 mod format;
 mod layout;
 mod model;
+mod procio;
 mod sysfs;
 mod ui;
 

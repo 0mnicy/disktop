@@ -21,8 +21,26 @@ with a capacity bar and a live graph of reads and writes.
 Early. Per-drive graphs work today. RAID arrays get one panel with a graph
 for each member disk inside it; on Linux, btrfs filesystems that span
 several disks are detected and grouped this way. Data moving *between*
-drives is drawn as dots marching along a route from one panel to another,
-currently with made-up data in `--demo` mode; detecting real copies is next.
+drives is drawn as dots marching along a route from one panel to another.
+On Linux these flows are real: disktop sees which process is copying from
+one drive to another. Elsewhere, `--demo` shows the flow view with
+made-up data.
+
+### How flows are found on Linux
+
+Every sample, disktop reads each process's storage I/O counters from
+`/proc`. A process that both read and wrote is a possible copy, so its open
+files are checked: which ones it opened for reading and for writing, and
+which drive each one is on. A process reading files on one drive and
+writing files on another is drawn as a flow between them, at the smaller of
+its read and write rates, and labeled with the process name. Files are
+traced to a drive through the process's own mount table, so programs in
+containers are covered too.
+
+Without root, only your own processes can be inspected; the footer says so.
+Run `sudo disktop` to see everything. Flows under 512 KiB/s are left out,
+and so is a process reading and writing the same drive, which is usually a
+database or a log rather than a copy.
 
 ## Install
 
@@ -78,14 +96,14 @@ room for a box per disk, member disks are drawn as compact rows.
 
 Drive stats come from [sysinfo](https://crates.io/crates/sysinfo), which
 supports Windows, Linux and macOS. On Linux, multi-disk btrfs filesystems
-and per-disk I/O are read from `/sys` and `/proc/diskstats`, which needs no
-root. Tested on Windows 11 and Ubuntu 24.04.
+and per-disk I/O are read from `/sys` and `/proc/diskstats`, and flows from
+`/proc`, none of which needs root. Tested on Windows 11 and Ubuntu 24.04.
 
 ## Roadmap
 
 - Detect more arrays: Storage Spaces on Windows; md, LVM and ZFS on Linux
-- Detect real flows: link reads on one drive to writes on another by the
-  process doing them (ETW on Windows, eBPF on Linux)
+- Detect real flows on Windows (ETW)
+- Show copies arriving over the network, which have no source drive
 - Focus mode to highlight one flow and dim the rest
 - Per-process view of who is hitting each drive
 - Keyboard controls for interval, layout and hiding drives
