@@ -10,9 +10,15 @@
 //! Files on network shares are on the `\Device\Mup` volume, which maps to
 //! the network panel, so copying from a share shows as a download.
 //!
+//! ETW hands events over in batches, some up to a second after they
+//! happened. Counting them as they arrive would make a steady copy look
+//! like it surges and stalls, so bytes are counted by when they actually
+//! moved, and a sample only takes the time slots whose events have all
+//! arrived. Flows show up about a second and a half late, at a steady rate.
+//!
 //! Starting a kernel trace session takes Administrator rights.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -21,9 +27,11 @@ use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
     EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
-    ProcessTrace, StartTraceW, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
+    TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{GUID, HSTRING, PWSTR};
 
 use crate::attribution::{self, ProcessIo};
@@ -50,9 +58,20 @@ const FILE_WRITE: u16 = 16;
 const IRP_PAGING_IO: u32 = 0x2;
 /// Where files on network shares live.
 pub const NETWORK_VOLUME: &str = r"\Device\Mup";
+/// The System process, which does I/O for the kernel.
+const SYSTEM_PID: u32 = 4;
 /// Forget which volume each open file is on past this many, so a long run
 /// doesn't grow without bound. Files opened again are learned again.
 const MAX_FILES: usize = 500_000;
+/// Bytes are counted in time slots this many to a second.
+const SLOTS_PER_SECOND: i64 = 10;
+/// How many slots back a sample stops: past the session's one-second
+/// flush timer, by when every event in them has arrived.
+const ARRIVAL_DELAY_SLOTS: i64 = 15;
+/// Slots kept while nothing samples them, such as while paused.
+const MAX_SLOTS: usize = 600;
+/// Forget process names past this many.
+const MAX_NAMES: usize = 10_000;
 
 /// Maps a volume device such as `\Device\HarddiskVolume3` to its panel.
 pub type VolumeGroups = HashMap<String, String>;
@@ -60,36 +79,65 @@ pub type VolumeGroups = HashMap<String, String>;
 /// One thing the trace reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Event {
-    Opened { file: u64, volume: String },
+    Opened { pid: u32, file: u64, volume: String },
     Read { pid: u32, file: u64, bytes: u64 },
     Wrote { pid: u32, file: u64, bytes: u64 },
     Received { pid: u32, bytes: u64 },
     Sent { pid: u32, bytes: u64 },
 }
 
-/// Bytes one process moved since the last sample.
+/// Bytes one process moved.
 #[derive(Debug, Default)]
 struct Moved {
+    /// The process's name, as it was while moving them.
+    name: Option<Arc<str>>,
     reads: HashMap<Arc<str>, u64>,
     writes: HashMap<Arc<str>, u64>,
     received: u64,
     sent: u64,
 }
 
+impl Moved {
+    fn add(&mut self, other: Moved) {
+        for (mine, theirs) in [
+            (&mut self.reads, other.reads),
+            (&mut self.writes, other.writes),
+        ] {
+            for (volume, bytes) in theirs {
+                *mine.entry(volume).or_default() += bytes;
+            }
+        }
+        self.received += other.received;
+        self.sent += other.sent;
+        if other.name.is_some() {
+            self.name = other.name;
+        }
+    }
+}
+
 /// Everything the trace has reported, shared with the callback ETW calls.
 #[derive(Debug, Default)]
 struct Tally {
-    /// The volume each open file is on, by its file object.
-    files: HashMap<u64, Arc<str>>,
+    /// The volume each open file is on, and the process that opened it,
+    /// by its file object.
+    files: HashMap<u64, (Arc<str>, u32)>,
     /// One shared copy of each volume name.
     volumes: HashMap<String, Arc<str>>,
-    processes: HashMap<u32, Moved>,
+    /// What each process moved, by the time slot it moved in.
+    slots: BTreeMap<i64, HashMap<u32, Moved>>,
+    /// The first slot no sample has taken yet.
+    open_from: i64,
+    /// Each process's name and the slot it was looked up in.
+    names: HashMap<u32, (Option<Arc<str>>, i64)>,
+    /// How to look up a process's name; left unset in tests.
+    name_of: Option<fn(u32) -> Option<String>>,
 }
 
 impl Tally {
-    fn record(&mut self, event: Event) {
+    /// Counts an event that happened in time slot `slot`.
+    fn record(&mut self, event: Event, slot: i64) {
         match event {
-            Event::Opened { file, volume } => {
+            Event::Opened { pid, file, volume } => {
                 if self.files.len() >= MAX_FILES {
                     self.files.clear();
                 }
@@ -101,26 +149,100 @@ impl Tally {
                         shared
                     }
                 };
-                self.files.insert(file, volume);
+                self.files.insert(file, (volume, pid));
             }
             Event::Read { pid, file, bytes } | Event::Wrote { pid, file, bytes } => {
                 let writing = matches!(event, Event::Wrote { .. });
-                if let Some(volume) = self.files.get(&file) {
-                    let moved = self.processes.entry(pid).or_default();
+                if let Some((volume, opener)) = self.files.get(&file).cloned() {
+                    // Windows 11 copies files in the kernel, so a program's
+                    // copy shows up as the System process writing a file
+                    // the program opened. It counts for the program.
+                    let pid = if pid == SYSTEM_PID { opener } else { pid };
+                    let moved = self.moved(pid, slot);
                     let side = if writing {
                         &mut moved.writes
                     } else {
                         &mut moved.reads
                     };
-                    *side.entry(volume.clone()).or_default() += bytes;
+                    *side.entry(volume).or_default() += bytes;
                 }
             }
-            Event::Received { pid, bytes } => {
-                self.processes.entry(pid).or_default().received += bytes
-            }
-            Event::Sent { pid, bytes } => self.processes.entry(pid).or_default().sent += bytes,
+            Event::Received { pid, bytes } => self.moved(pid, slot).received += bytes,
+            Event::Sent { pid, bytes } => self.moved(pid, slot).sent += bytes,
         }
     }
+
+    /// Where to count what `pid` moved in `slot`. An event arriving after a
+    /// sample took its slot counts toward the next sample instead.
+    fn moved(&mut self, pid: u32, slot: i64) -> &mut Moved {
+        if self.slots.len() >= MAX_SLOTS
+            && let Some((oldest, _)) = self.slots.pop_first()
+        {
+            self.open_from = self.open_from.max(oldest + 1);
+        }
+        let slot = slot.max(self.open_from);
+        let seen = self.slots.get(&slot).is_some_and(|p| p.contains_key(&pid));
+        let name = if seen { None } else { self.name(pid, slot) };
+        let moved = self.slots.entry(slot).or_default().entry(pid).or_default();
+        if name.is_some() {
+            moved.name = name;
+        }
+        moved
+    }
+
+    /// A process's name, looked up while it's moving data: by the time a
+    /// sample comes along, a short-lived process may be gone and its id
+    /// given to another. A busy process is looked up again once a second,
+    /// in case its id was reused; one that has exited keeps its last name.
+    fn name(&mut self, pid: u32, slot: i64) -> Option<Arc<str>> {
+        if let Some((name, looked_up)) = self.names.get(&pid)
+            && slot - looked_up < SLOTS_PER_SECOND
+        {
+            return name.clone();
+        }
+        let found = self
+            .name_of
+            .and_then(|name_of| name_of(pid))
+            .map(Arc::from)
+            .or_else(|| self.names.get(&pid).and_then(|(name, _)| name.clone()));
+        if self.names.len() >= MAX_NAMES {
+            self.names.clear();
+        }
+        self.names.insert(pid, (found.clone(), slot));
+        found
+    }
+
+    /// Takes what each process moved before slot `until`, along with the
+    /// first slot that covers.
+    fn take_before(&mut self, until: i64) -> (i64, HashMap<u32, Moved>) {
+        let from = self.open_from;
+        let later = self.slots.split_off(&until);
+        let taken = std::mem::replace(&mut self.slots, later);
+        self.open_from = from.max(until);
+        let mut processes: HashMap<u32, Moved> = HashMap::new();
+        for (pid, moved) in taken.into_values().flatten() {
+            processes.entry(pid).or_default().add(moved);
+        }
+        (from, processes)
+    }
+}
+
+/// The time slot a performance-counter reading falls in.
+fn slot_of(ticks: i64) -> i64 {
+    static FREQUENCY: OnceLock<i64> = OnceLock::new();
+    let frequency = *FREQUENCY.get_or_init(|| {
+        let mut frequency = 0;
+        let _ = unsafe { QueryPerformanceFrequency(&mut frequency) };
+        frequency.max(1)
+    });
+    (i128::from(ticks) * i128::from(SLOTS_PER_SECOND) / i128::from(frequency)) as i64
+}
+
+/// The time slot it is now.
+fn now_slot() -> i64 {
+    let mut ticks = 0;
+    let _ = unsafe { QueryPerformanceCounter(&mut ticks) };
+    slot_of(ticks)
 }
 
 fn tally() -> &'static Mutex<Tally> {
@@ -139,7 +261,12 @@ impl EtwFlows {
     /// Starts the trace session. Without Administrator rights this fails,
     /// and [`EtwFlows::problem`] says so.
     pub fn start() -> Self {
-        match start_session() {
+        if let Ok(mut tally) = tally().lock() {
+            tally.slots.clear();
+            tally.open_from = now_slot();
+            tally.name_of = Some(win::process_name);
+        }
+        match start_session(on_event) {
             Ok(()) => Self {
                 running: true,
                 problem: None,
@@ -159,15 +286,21 @@ impl EtwFlows {
         self.problem.as_deref()
     }
 
-    /// The flows since the last call, `elapsed_secs` ago.
-    pub fn sample(&mut self, elapsed_secs: f64, volumes: &VolumeGroups) -> Vec<Flow> {
-        if !self.running || elapsed_secs <= 0.0 {
+    /// The flows from where the last call left off until a moment ago, as
+    /// late as every event has surely arrived.
+    pub fn sample(&mut self, volumes: &VolumeGroups) -> Vec<Flow> {
+        if !self.running {
             return Vec::new();
         }
-        let moved = match tally().lock() {
-            Ok(mut tally) => std::mem::take(&mut tally.processes),
+        let until = now_slot() - ARRIVAL_DELAY_SLOTS;
+        let (from, moved) = match tally().lock() {
+            Ok(mut tally) => tally.take_before(until),
             Err(_) => return Vec::new(),
         };
+        let elapsed_secs = (until - from) as f64 / SLOTS_PER_SECOND as f64;
+        if elapsed_secs <= 0.0 {
+            return Vec::new();
+        }
 
         let mut flows = Vec::new();
         for (pid, moved) in moved {
@@ -192,7 +325,10 @@ impl EtwFlows {
                 sent: per_second(moved.sent),
             };
             if io.is_busy() {
-                let process = win::process_name(pid).unwrap_or_else(|| pid.to_string());
+                let process = moved
+                    .name
+                    .as_deref()
+                    .map_or_else(|| pid.to_string(), str::to_string);
                 attribution::add_process_flows(&mut flows, &process, &io);
             }
         }
@@ -243,7 +379,7 @@ fn parse(
                 };
                 let file = pointer_at(file_at)?;
                 let volume = volume_of(&utf16_until_nul(data.get(name_at..)?))?;
-                Some(Event::Opened { file, volume })
+                Some(Event::Opened { pid, file, volume })
             }
             FILE_READ | FILE_WRITE => {
                 // ByteOffset, Irp, [ThreadId in version 0], FileObject,
@@ -361,7 +497,8 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
         data,
     ) && let Ok(mut tally) = tally().lock()
     {
-        tally.record(event);
+        // A raw performance-counter reading, the same clock as now_slot.
+        tally.record(event, slot_of(header.TimeStamp));
     }
 }
 
@@ -387,7 +524,8 @@ fn session_properties() -> Vec<u64> {
     buffer
 }
 
-fn start_session() -> Result<(), u32> {
+/// Starts the session, with `callback` called for every event.
+fn start_session(callback: unsafe extern "system" fn(*mut EVENT_RECORD)) -> Result<(), u32> {
     stop_session();
     let mut properties = session_properties();
     let mut session = CONTROLTRACE_HANDLE::default();
@@ -425,9 +563,11 @@ fn start_session() -> Result<(), u32> {
             LoggerName: PWSTR(name.as_mut_ptr()),
             ..Default::default()
         };
-        logfile.Anonymous1.ProcessTraceMode =
-            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-        logfile.Anonymous2.EventRecordCallback = Some(on_event);
+        // Raw timestamps leave event times as performance-counter readings.
+        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+            | PROCESS_TRACE_MODE_EVENT_RECORD
+            | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+        logfile.Anonymous2.EventRecordCallback = Some(callback);
         let consumer = OpenTraceW(&mut logfile);
         if consumer.Value == u64::MAX {
             stop_session();
@@ -609,6 +749,7 @@ mod tests {
             &name,
         ]);
         let expected = Some(Event::Opened {
+            pid: 0,
             file: FILE_OBJECT,
             volume: r"\Device\HarddiskVolume3".into(),
         });
@@ -735,37 +876,50 @@ mod tests {
     #[test]
     fn the_tally_adds_up_bytes_per_process_and_volume() {
         let mut tally = Tally::default();
-        tally.record(Event::Opened {
-            file: 1,
-            volume: r"\Device\HarddiskVolume3".into(),
-        });
-        tally.record(Event::Opened {
-            file: 2,
-            volume: r"\Device\HarddiskVolume5".into(),
-        });
-        tally.record(Event::Read {
+        tally.record(
+            Event::Opened {
+                pid: 9,
+                file: 1,
+                volume: r"\Device\HarddiskVolume3".into(),
+            },
+            0,
+        );
+        tally.record(
+            Event::Opened {
+                pid: 9,
+                file: 2,
+                volume: r"\Device\HarddiskVolume5".into(),
+            },
+            0,
+        );
+        let read = |bytes| Event::Read {
             pid: 9,
             file: 1,
-            bytes: 100,
-        });
-        tally.record(Event::Read {
-            pid: 9,
-            file: 1,
-            bytes: 50,
-        });
-        tally.record(Event::Wrote {
-            pid: 9,
-            file: 2,
-            bytes: 150,
-        });
-        tally.record(Event::Read {
-            pid: 9,
-            file: 77,
-            bytes: 999,
-        });
-        tally.record(Event::Received { pid: 9, bytes: 10 });
+            bytes,
+        };
+        tally.record(read(100), 1);
+        tally.record(read(50), 2);
+        tally.record(
+            Event::Wrote {
+                pid: 9,
+                file: 2,
+                bytes: 150,
+            },
+            2,
+        );
+        tally.record(
+            Event::Read {
+                pid: 9,
+                file: 77,
+                bytes: 999,
+            },
+            2,
+        );
+        tally.record(Event::Received { pid: 9, bytes: 10 }, 2);
 
-        let moved = &tally.processes[&9];
+        let (from, processes) = tally.take_before(3);
+        assert_eq!(from, 0);
+        let moved = &processes[&9];
         assert_eq!(moved.reads[r"\Device\HarddiskVolume3"], 150);
         assert_eq!(moved.writes[r"\Device\HarddiskVolume5"], 150);
         assert_eq!(
@@ -774,5 +928,215 @@ mod tests {
             "a file opened before tracing is skipped"
         );
         assert_eq!(moved.received, 10);
+    }
+
+    #[test]
+    fn bytes_count_toward_when_they_moved_not_when_they_arrived() {
+        let mut tally = Tally {
+            open_from: 10,
+            ..Tally::default()
+        };
+        let sent = |bytes| Event::Sent { pid: 1, bytes };
+        // Events from slots 10 to 14 arrive out of order.
+        tally.record(sent(400), 14);
+        tally.record(sent(100), 10);
+        tally.record(sent(200), 12);
+
+        // A sample up to slot 13 gets slots 10 to 12 and leaves slot 14.
+        let (from, taken) = tally.take_before(13);
+        assert_eq!(from, 10);
+        assert_eq!(taken[&1].sent, 300);
+
+        // Something from slot 11 arriving even later counts in the next
+        // sample rather than being lost.
+        tally.record(sent(50), 11);
+        let (from, taken) = tally.take_before(15);
+        assert_eq!(from, 13);
+        assert_eq!(taken[&1].sent, 450);
+    }
+
+    /// One raw file event, for `print_events`.
+    #[derive(Debug, Clone)]
+    struct RawEvent {
+        pid: u32,
+        id: u16,
+        file: u64,
+        bytes: u64,
+        flags: u32,
+        name: String,
+    }
+
+    fn raw_events() -> &'static Mutex<Vec<RawEvent>> {
+        static EVENTS: OnceLock<Mutex<Vec<RawEvent>>> = OnceLock::new();
+        EVENTS.get_or_init(Mutex::default)
+    }
+
+    unsafe extern "system" fn collect_event(record: *mut EVENT_RECORD) {
+        let Some(record) = (unsafe { record.as_ref() }) else {
+            return;
+        };
+        let header = &record.EventHeader;
+        if header.ProviderId != FILE_PROVIDER || header.EventDescriptor.Version != 1 {
+            return;
+        }
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                record.UserData as *const u8,
+                usize::from(record.UserDataLength),
+            )
+        };
+        let u32_at = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
+        let id = header.EventDescriptor.Id;
+        let event = match id {
+            FILE_CREATE => RawEvent {
+                pid: header.ProcessId,
+                id,
+                file: u64_at(8),
+                bytes: 0,
+                flags: 0,
+                name: utf16_until_nul(&data[32..]),
+            },
+            FILE_READ | FILE_WRITE => RawEvent {
+                pid: header.ProcessId,
+                id,
+                file: u64_at(16),
+                bytes: u64::from(u32_at(36)),
+                flags: u32_at(40),
+                name: String::new(),
+            },
+            _ => return,
+        };
+        raw_events().lock().unwrap().push(event);
+    }
+
+    /// Prints what the kernel reports about the file I/O of one command,
+    /// for working out how a program's copies look to ETW. Run as
+    /// Administrator with `CMD="copy a b" cargo test print_events --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_events() {
+        let command = std::env::var("CMD").expect("CMD to run");
+        start_session(collect_event).expect("run as Administrator");
+        thread::sleep(std::time::Duration::from_secs(2));
+        use std::os::windows::process::CommandExt;
+
+        // Passed as written, since cmd doesn't follow the usual quoting.
+        let mut child = std::process::Command::new("cmd")
+            .raw_arg(format!("/C {command}"))
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        thread::sleep(std::time::Duration::from_secs(3));
+        stop_session();
+
+        let events = raw_events().lock().unwrap().clone();
+        let names: HashMap<u64, String> = events
+            .iter()
+            .filter(|e| e.id == FILE_CREATE)
+            .map(|e| (e.file, e.name.clone()))
+            .collect();
+        println!("command ran as pid {pid}");
+        // Totals by process, event, paging and whether the file is known.
+        let mut totals: BTreeMap<(u32, u16, bool, String), (u64, u64)> = BTreeMap::new();
+        for e in events.iter().filter(|e| e.id != FILE_CREATE) {
+            let volume = names
+                .get(&e.file)
+                .and_then(|n| volume_of(n))
+                .unwrap_or_else(|| "(opened before tracing)".into());
+            let key = (e.pid, e.id, e.flags & IRP_PAGING_IO != 0, volume);
+            let total = totals.entry(key).or_default();
+            total.0 += 1;
+            total.1 += e.bytes;
+        }
+        let mut rows: Vec<_> = totals.into_iter().collect();
+        rows.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        for ((p, id, paging, volume), (count, bytes)) in rows.into_iter().take(25) {
+            let what = if id == FILE_READ { "read " } else { "write" };
+            let paging = if paging { "paging" } else { "      " };
+            println!("pid {p:>6} {what} {paging} {volume:<28} {count:>7} events {bytes:>12} bytes");
+        }
+        for e in events
+            .iter()
+            .filter(|e| e.pid == pid && e.id == FILE_CREATE)
+        {
+            println!("pid {pid} opened {}", e.name);
+        }
+        let mut flags: BTreeMap<u32, u64> = BTreeMap::new();
+        for e in events
+            .iter()
+            .filter(|e| e.pid == pid && e.id != FILE_CREATE)
+        {
+            *flags.entry(e.flags).or_default() += 1;
+        }
+        println!("IOFlags of the command's reads and writes: {flags:x?}");
+    }
+
+    #[test]
+    fn kernel_copies_count_for_the_program_that_opened_the_files() {
+        let mut tally = Tally::default();
+        let open = |file, volume: &str| Event::Opened {
+            pid: 300,
+            file,
+            volume: volume.into(),
+        };
+        tally.record(open(1, r"\Device\HarddiskVolume3"), 0);
+        tally.record(open(2, r"\Device\HarddiskVolume6"), 0);
+        // What `copy` looks like: the program reads, the kernel writes.
+        tally.record(
+            Event::Read {
+                pid: 300,
+                file: 1,
+                bytes: 100,
+            },
+            1,
+        );
+        tally.record(
+            Event::Wrote {
+                pid: SYSTEM_PID,
+                file: 2,
+                bytes: 100,
+            },
+            1,
+        );
+        let (_, taken) = tally.take_before(2);
+        assert_eq!(taken.len(), 1, "nothing is left for System");
+        assert_eq!(taken[&300].reads[r"\Device\HarddiskVolume3"], 100);
+        assert_eq!(taken[&300].writes[r"\Device\HarddiskVolume6"], 100);
+    }
+
+    #[test]
+    fn processes_are_named_while_they_move_data() {
+        let mut tally = Tally {
+            name_of: Some(|pid| Some(format!("app{pid}.exe"))),
+            ..Tally::default()
+        };
+        tally.record(Event::Received { pid: 5, bytes: 1 }, 0);
+        // The process exits, so looking it up again finds nothing.
+        tally.name_of = Some(|_| None);
+        tally.record(Event::Received { pid: 5, bytes: 1 }, 20);
+        let (_, taken) = tally.take_before(30);
+        assert_eq!(taken[&5].name.as_deref(), Some("app5.exe"));
+
+        // Its id goes to another program, which is looked up anew.
+        tally.name_of = Some(|_| Some("other.exe".to_string()));
+        tally.record(Event::Received { pid: 5, bytes: 1 }, 40);
+        let (_, taken) = tally.take_before(50);
+        assert_eq!(taken[&5].name.as_deref(), Some("other.exe"));
+    }
+
+    #[test]
+    fn slots_nobody_takes_are_forgotten_oldest_first() {
+        let mut tally = Tally::default();
+        for slot in 0..MAX_SLOTS as i64 + 10 {
+            tally.record(Event::Received { pid: 1, bytes: 1 }, slot);
+        }
+        assert_eq!(tally.slots.len(), MAX_SLOTS);
+        // A sample afterwards covers only the slots still kept.
+        let (from, taken) = tally.take_before(i64::MAX);
+        assert_eq!(from, 10);
+        assert_eq!(taken[&1].received, MAX_SLOTS as u64);
     }
 }

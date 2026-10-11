@@ -788,31 +788,68 @@ mod snapshot {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let width = std::env::var("COLS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(160);
-        let height = std::env::var("ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
-        let at = std::env::var("AT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(23.0);
-
+        let (width, height) = (var("COLS", 160), var("ROWS", 50));
         let mut demo = crate::demo::Demo::new();
-        demo.advance_to(at);
+        demo.advance_to(var("AT", 23.0));
         let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1), None, 20);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        for _ in 0..120 {
+        animate(&mut terminal, &mut app, 120);
+        print_screen(&terminal);
+    }
+
+    /// Prints this machine's real drives and flows as text, once a second,
+    /// for checking flows where there's no screen to watch, such as over
+    /// SSH or from an Administrator window. Run with
+    /// `cargo test print_live -- --ignored --nocapture`; SECS sets how long
+    /// (default 30).
+    #[test]
+    #[ignore]
+    fn print_live() {
+        use std::time::Duration;
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (width, height) = (var("COLS", 160), var("ROWS", 50));
+        let monitor = crate::drives::DriveMonitor::new();
+        let mut app = crate::app::App::new(Box::new(monitor), Duration::from_secs(1), None, 20);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        for second in 1..=var("SECS", 30) {
+            std::thread::sleep(app.interval);
+            app.source.sample();
+            app.field.sync(app.source.flows());
+            app.flow_list_rows = app.flow_list_rows.max(super::flow_list_rows(&app.field));
+            animate(&mut terminal, &mut app, 20);
+            println!("--- {second}s");
+            print_screen(&terminal);
+        }
+    }
+
+    /// An environment variable, or `default` when it's missing or invalid.
+    fn var<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Draws `frames` animation frames, 50 ms apart.
+    fn animate(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &mut crate::app::App,
+        frames: usize,
+    ) {
+        for _ in 0..frames {
             let mut lengths = Vec::new();
             terminal
-                .draw(|frame| lengths = super::draw(frame, &app))
+                .draw(|frame| lengths = super::draw(frame, app))
                 .unwrap();
             app.field.set_lengths(&lengths);
-            app.field.step(0.033);
+            app.field.step(0.05);
         }
+    }
+
+    fn print_screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) {
         let buffer = terminal.backend().buffer();
         for y in 0..buffer.area.height {
             let line: String = (0..buffer.area.width)

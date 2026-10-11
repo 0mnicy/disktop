@@ -237,9 +237,11 @@ impl Tracer {
         self.0.sample(elapsed_secs, devices, &hardware)
     }
 
+    /// ETW times every event itself, so the time since the last sample
+    /// isn't needed.
     #[cfg(windows)]
-    fn sample(&mut self, elapsed_secs: Option<f64>, devices: &DeviceGroups) -> Vec<Flow> {
-        elapsed_secs.map_or_else(Vec::new, |elapsed| self.0.sample(elapsed, devices))
+    fn sample(&mut self, _elapsed_secs: Option<f64>, devices: &DeviceGroups) -> Vec<Flow> {
+        self.0.sample(devices)
     }
 }
 

@@ -63,7 +63,12 @@ the file and the process doing it, so disktop adds up how much each process
 read from and wrote to each drive, and how much it received and sent over
 the network to other machines. That is turned into copies, downloads and
 uploads the same way as on Linux. Files on network shares count as the
-Network panel.
+Network panel. Windows 11 does the writing half of a copy in the kernel,
+so that I/O is counted for the program that opened the file.
+
+Windows hands trace events over in batches, some a second after the data
+moved, so disktop counts bytes by when they actually moved. Flows on
+Windows show up about a second and a half late, but at a steady rate.
 
 ETW needs Administrator, so run disktop from an Administrator terminal to
 see flows; otherwise the footer says so, and the panels and graphs still

@@ -23,6 +23,7 @@ windows = { version = "0.62.2", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Etw",
+    "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_System_Time",
 ] }
