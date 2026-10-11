@@ -12,6 +12,8 @@
 //! rest from the network. That becomes a flow from the network panel, but
 //! never bigger than what the process's network actually received, since
 //! programs also write things they made themselves, like databases and logs.
+//! Uploads are the same in reverse: reading a drive more than it wrote to
+//! other drives, capped at what its network sent.
 //!
 //! Without root this only sees processes run by the same user. Paths are
 //! rooted at a parameter so tests can use a fake tree; where `/proc` doesn't
@@ -38,17 +40,40 @@ struct Seen {
     written: u64,
     /// File offsets by descriptor, to weigh which files moved the data.
     positions: HashMap<u32, u64>,
-    /// Bytes its network had received, read while it was writing.
-    received: Option<u64>,
+    /// Bytes its network had received and sent, read while it was busy.
+    network: Option<(u64, u64)>,
 }
 
 /// One open file that counts towards a process's reads or writes.
 #[derive(Debug, Clone, PartialEq)]
 struct OpenFile {
     group: String,
+    reads: bool,
     writes: bool,
     /// Bytes this descriptor's offset moved since last time.
     moved: u64,
+}
+
+/// Which way data moves through a process's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Reading,
+    Writing,
+}
+
+impl OpenFile {
+    /// Opened for this side.
+    fn can(&self, side: Side) -> bool {
+        match side {
+            Side::Reading => self.reads,
+            Side::Writing => self.writes,
+        }
+    }
+
+    /// Opened for this side only, not both.
+    fn only(&self, side: Side) -> bool {
+        self.can(side) && self.reads != self.writes
+    }
 }
 
 /// What a process has open: files on known drives, and the inode numbers
@@ -109,7 +134,7 @@ impl ProcFlows {
                 read,
                 written,
                 positions: HashMap::new(),
-                received: None,
+                network: None,
             };
 
             if let (Some(elapsed), Some(before)) = (elapsed_secs, previous)
@@ -117,9 +142,9 @@ impl ProcFlows {
             {
                 let read_rate = read.saturating_sub(before.read) as f64 / elapsed;
                 let write_rate = written.saturating_sub(before.written) as f64 / elapsed;
-                if write_rate >= MIN_FLOW_RATE {
-                    now.received =
-                        read_text(&dir.join("net/dev")).map(|text| received(&text, hardware));
+                if read_rate.max(write_rate) >= MIN_FLOW_RATE {
+                    now.network =
+                        read_text(&dir.join("net/dev")).map(|text| traffic(&text, hardware));
                     let opened = open_files(&dir, devices, &before.positions, &mut now.positions);
                     let process = read_text(&dir.join("comm"))
                         .map(|c| c.trim().to_string())
@@ -137,16 +162,32 @@ impl ProcFlows {
                     }
 
                     // Whatever it wrote that didn't come from another drive
-                    // came from the network, if it's talking to one, up to
-                    // what its network received.
-                    let network_rate = match (before.received, now.received) {
-                        (Some(before), Some(now)) => now.saturating_sub(before) as f64 / elapsed,
-                        _ => 0.0,
+                    // came from the network, up to what its network received,
+                    // and whatever it read that didn't go to another drive
+                    // went out, up to what its network sent. Either way it
+                    // has to be talking to another machine.
+                    let (received, sent) = match (before.network, now.network) {
+                        (Some((rx0, tx0)), Some((rx1, tx1))) => (
+                            rx1.saturating_sub(rx0) as f64 / elapsed,
+                            tx1.saturating_sub(tx0) as f64 / elapsed,
+                        ),
+                        _ => (0.0, 0.0),
                     };
-                    let downloaded = (write_rate - copied).min(network_rate);
-                    if downloaded >= MIN_FLOW_RATE && connected(&dir, &opened.sockets) {
-                        for (to, share) in shares(&opened.files, true) {
-                            add_flow(&mut flows, NETWORK.into(), to, downloaded * share, &process);
+                    let downloaded = (write_rate - copied).min(received);
+                    let uploaded = (read_rate - copied).min(sent);
+                    if downloaded.max(uploaded) >= MIN_FLOW_RATE && connected(&dir, &opened.sockets)
+                    {
+                        if downloaded >= MIN_FLOW_RATE {
+                            for (to, share) in shares(&opened.files, Side::Writing) {
+                                let rate = downloaded * share;
+                                add_flow(&mut flows, NETWORK.into(), to, rate, &process);
+                            }
+                        }
+                        if uploaded >= MIN_FLOW_RATE {
+                            for (from, share) in shares(&opened.files, Side::Reading) {
+                                let rate = uploaded * share;
+                                add_flow(&mut flows, from, NETWORK.into(), rate, &process);
+                            }
                         }
                     }
                 }
@@ -222,6 +263,7 @@ fn open_files(
             .map_or(0, |&old| info.position.saturating_sub(old));
         opened.files.push(OpenFile {
             group: group.clone(),
+            reads: info.reads,
             writes: info.writes,
             moved,
         });
@@ -229,26 +271,28 @@ fn open_files(
     opened
 }
 
-/// Bytes received on the network a process sees, from its `net/dev`. A
-/// process outside any container sees the host's interfaces, and only the
-/// hardware ones count, so traffic between local containers isn't taken for
-/// downloads. A process in a container sees only its own virtual interface,
-/// and that counts.
-fn received(text: &str, hardware: &[String]) -> u64 {
+/// Bytes (received, sent) on the network a process sees, from its
+/// `net/dev`. A process outside any container sees the host's interfaces,
+/// and only the hardware ones count, so traffic between local containers
+/// isn't taken for downloads or uploads. A process in a container sees only
+/// its own virtual interface, and that counts.
+fn traffic(text: &str, hardware: &[String]) -> (u64, u64) {
     let stats = sysfs::parse_net_dev(text);
-    let on_hardware: Vec<u64> = hardware
-        .iter()
-        .filter_map(|name| stats.get(name))
-        .map(|&(rx, _)| rx)
-        .collect();
+    let sum = |counters: Vec<&(u64, u64)>| {
+        counters
+            .iter()
+            .fold((0, 0), |(rx, tx), &&(r, t)| (rx + r, tx + t))
+    };
+    let on_hardware: Vec<&(u64, u64)> =
+        hardware.iter().filter_map(|name| stats.get(name)).collect();
     if on_hardware.is_empty() {
-        stats
+        sum(stats
             .iter()
             .filter(|(name, _)| name.as_str() != "lo")
-            .map(|(_, &(rx, _))| rx)
-            .sum()
+            .map(|(_, counters)| counters)
+            .collect())
     } else {
-        on_hardware.iter().sum()
+        sum(on_hardware)
     }
 }
 
@@ -267,9 +311,16 @@ fn connected(dir: &Path, sockets: &HashSet<u64>) -> bool {
 }
 
 /// The group shares on one side of a process's open files: how the bytes
-/// it read (or wrote) divide between drives.
-fn shares(files: &[OpenFile], writes: bool) -> Vec<(String, f64)> {
-    let side: Vec<&OpenFile> = files.iter().filter(|f| f.writes == writes).collect();
+/// it read (or wrote) divide between drives. Files opened for just that
+/// side are used when there are any; otherwise files opened for reading
+/// and writing, which is how torrent clients open the data they share.
+fn shares(files: &[OpenFile], side: Side) -> Vec<(String, f64)> {
+    let only: Vec<&OpenFile> = files.iter().filter(|f| f.only(side)).collect();
+    let side: Vec<&OpenFile> = if only.is_empty() {
+        files.iter().filter(|f| f.can(side)).collect()
+    } else {
+        only
+    };
     let total_moved: u64 = side.iter().map(|f| f.moved).sum();
     let mut shares: Vec<(String, f64)> = Vec::new();
     for file in &side {
@@ -291,8 +342,8 @@ fn shares(files: &[OpenFile], writes: bool) -> Vec<(String, f64)> {
 /// When offsets don't move (programs using positioned reads and writes),
 /// each open file counts equally.
 fn attribute(files: &[OpenFile], rate: f64) -> Vec<(String, String, f64)> {
-    let reads = shares(files, false);
-    let writes = shares(files, true);
+    let reads = shares(files, Side::Reading);
+    let writes = shares(files, Side::Writing);
 
     let mut flows = Vec::new();
     for (from, read_share) in &reads {
@@ -321,6 +372,8 @@ fn parse_io(text: &str) -> Option<(u64, u64)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FdInfo {
     position: u64,
+    /// Opened for reading (read-only or read-write).
+    reads: bool,
     /// Opened for writing (write-only or read-write).
     writes: bool,
     mount_id: u32,
@@ -336,10 +389,12 @@ fn parse_fdinfo(text: &str) -> Option<FdInfo> {
             .map(str::trim)
     };
     let flags = u32::from_str_radix(field("flags:")?, 8).ok()?;
+    // The low two bits are the access mode: 0 read-only, 1 write-only, 2 both.
+    let mode = flags & 0o3;
     Some(FdInfo {
         position: field("pos:")?.parse().ok()?,
-        // The low two bits are the access mode: 0 read-only, 1 write-only, 2 both.
-        writes: flags & 0o3 != 0,
+        reads: mode != 1,
+        writes: mode != 0,
         mount_id: field("mnt_id:")?.parse().ok()?,
         inode: field("ino:").and_then(|v| v.parse().ok()),
     })
@@ -432,6 +487,7 @@ mod tests {
             parse_fdinfo(read_only),
             Some(FdInfo {
                 position: MIB,
+                reads: true,
                 writes: false,
                 mount_id: 36,
                 inode: Some(42),
@@ -439,8 +495,10 @@ mod tests {
         );
         let write_only = "pos:\t0\nflags:\t0101101\nmnt_id:\t40\n";
         assert!(parse_fdinfo(write_only).unwrap().writes);
+        assert!(!parse_fdinfo(write_only).unwrap().reads);
         let read_write = "pos:\t0\nflags:\t02\nmnt_id:\t40\n";
         assert!(parse_fdinfo(read_write).unwrap().writes);
+        assert!(parse_fdinfo(read_write).unwrap().reads);
         assert_eq!(parse_fdinfo("pos:\t0\n"), None);
     }
 
@@ -459,12 +517,32 @@ mod tests {
         assert_eq!(mounts[&50], "proc");
     }
 
+    /// A file opened read-only, or write-only when `writes`.
     fn file(group: &str, writes: bool, moved: u64) -> OpenFile {
         OpenFile {
             group: group.into(),
+            reads: !writes,
             writes,
             moved,
         }
+    }
+
+    #[test]
+    fn read_write_files_count_only_when_nothing_more_specific_is_open() {
+        let both = OpenFile {
+            group: "/main".into(),
+            reads: true,
+            writes: true,
+            moved: 0,
+        };
+        // A torrent client's data file, alone: it counts on both sides.
+        let alone = std::slice::from_ref(&both);
+        assert_eq!(shares(alone, Side::Reading), vec![("/main".into(), 1.0)]);
+        assert_eq!(shares(alone, Side::Writing), vec![("/main".into(), 1.0)]);
+        // Next to a file opened just for writing, it's left out of that side.
+        let files = [both, file("/", true, 0)];
+        assert_eq!(shares(&files, Side::Writing), vec![("/".into(), 1.0)]);
+        assert_eq!(shares(&files, Side::Reading), vec![("/main".into(), 1.0)]);
     }
 
     #[test]
@@ -591,6 +669,7 @@ mod tests {
         /// (fd 7, inode 333), while also reading `seeding` bytes from /main
         /// for someone else.
         fn downloader(&self, pid: u32, progress: u64, received: u64, seeding: u64, remote: bool) {
+            self.connection(pid, remote);
             self.write(
                 &format!("{pid}/net/dev"),
                 &format!(
@@ -614,6 +693,11 @@ mod tests {
                 &format!("{pid}/fdinfo/6"),
                 "pos:\t0\nflags:\t0100000\nmnt_id:\t36\n",
             );
+        }
+
+        /// Fd 7 as a TCP connection (inode 333) to another machine, or to
+        /// this one when not `remote`.
+        fn connection(&self, pid: u32, remote: bool) {
             self.write(
                 &format!("{pid}/fdinfo/7"),
                 "pos:\t0\nflags:\t02\nmnt_id:\t9\nino:\t333\n",
@@ -628,6 +712,29 @@ mod tests {
                 &format!(
                     "  sl  local_address rem_address   st\n   0: 0A00000A:C350 {far_end} 01 0 0 0 0 0 333 1\n"
                 ),
+            );
+        }
+
+        /// A media server that has read `progress` bytes from /main and its
+        /// container's network has sent `sent` bytes.
+        fn streamer(&self, pid: u32, progress: u64, sent: u64) {
+            self.connection(pid, true);
+            self.write(&format!("{pid}/comm"), "Plex Media Serv\n");
+            self.write(
+                &format!("{pid}/io"),
+                &format!("read_bytes: {progress}\nwrite_bytes: 4096\n"),
+            );
+            self.write(
+                &format!("{pid}/mountinfo"),
+                "36 29 0:45 / /data rw - btrfs /dev/sdb rw\n",
+            );
+            self.write(
+                &format!("{pid}/fdinfo/6"),
+                "pos:\t0\nflags:\t0100000\nmnt_id:\t36\n",
+            );
+            self.write(
+                &format!("{pid}/net/dev"),
+                &format!("Inter-|\n face |\n  eth0: 0 1 0 0 0 0 0 0 {sent} 1 0 0 0 0 0 0\n"),
             );
         }
     }
@@ -688,10 +795,46 @@ mod tests {
     #[test]
     fn host_processes_count_only_hardware_interfaces() {
         let text = "Inter-|\n face |\n    lo: 900 0 0 0 0 0 0 0 900 0 0 0 0 0 0 0\n  eno1: 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\ndocker0: 5000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
-        assert_eq!(received(text, &["eno1".to_string()]), 100);
+        assert_eq!(traffic(text, &["eno1".to_string()]), (100, 0));
         // In a container there's no hardware interface, so everything but
         // loopback counts.
-        assert_eq!(received(text, &[]), 5100);
+        assert_eq!(traffic(text, &[]), (5100, 0));
+    }
+
+    #[test]
+    fn an_upload_is_a_flow_to_the_network() {
+        let proc = FakeProc::new("upload");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.streamer(90, 0, 0);
+        tracer.sample(None, &devices, &[]);
+        proc.streamer(90, 8 * MIB, 8 * MIB);
+        tracer.sample(Some(1.0), &devices, &[]);
+        proc.streamer(90, 28 * MIB, 28 * MIB);
+        let flows = tracer.sample(Some(1.0), &devices, &[]);
+        assert_eq!(
+            flows,
+            vec![Flow {
+                from: "/main".into(),
+                to: NETWORK.into(),
+                rate: (20 * MIB) as f64,
+                process: "Plex Media Serv".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reading_without_sending_is_not_an_upload() {
+        // Scanning a library reads a lot but sends almost nothing.
+        let proc = FakeProc::new("scanner");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.streamer(91, 0, 0);
+        tracer.sample(None, &devices, &[]);
+        proc.streamer(91, 30 * MIB, 10 * 1024);
+        tracer.sample(Some(1.0), &devices, &[]);
+        proc.streamer(91, 60 * MIB, 20 * 1024);
+        assert!(tracer.sample(Some(1.0), &devices, &[]).is_empty());
     }
 
     #[test]

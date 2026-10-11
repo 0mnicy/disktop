@@ -25,7 +25,7 @@ struct ScriptedFlow {
     process: &'static str,
 }
 
-const SCRIPT: [ScriptedFlow; 5] = [
+const SCRIPT: [ScriptedFlow; 6] = [
     ScriptedFlow {
         from: "D:\\",
         to: "M:\\",
@@ -65,6 +65,14 @@ const SCRIPT: [ScriptedFlow; 5] = [
         end: 40.0,
         rate: 45.0 * MIB,
         process: "qbittorrent.exe",
+    },
+    ScriptedFlow {
+        from: "M:\\",
+        to: NETWORK,
+        start: 4.0,
+        end: 52.0,
+        rate: 12.0 * MIB,
+        process: "Plex Media Server.exe",
     },
 ];
 
@@ -361,7 +369,12 @@ mod tests {
             .collect();
         assert_eq!(
             routes,
-            vec![("D:\\", "M:\\"), ("C:\\", "E:\\"), (NETWORK, "D:\\")]
+            vec![
+                ("D:\\", "M:\\"),
+                ("C:\\", "E:\\"),
+                (NETWORK, "D:\\"),
+                ("M:\\", NETWORK)
+            ]
         );
 
         demo.advance_to(59.5);

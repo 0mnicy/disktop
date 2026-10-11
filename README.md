@@ -44,7 +44,11 @@ machine, the rest came from the network, and it's drawn as a flow from the
 Network panel to that drive. It's never bigger than what the process's
 network actually received (its container's own interface, or the
 machine's), so a program writing its own database or logs isn't mistaken
-for a download.
+for a download. Uploads are the same in reverse: a process reading a drive
+more than it wrote to other drives, capped at what its network sent, is a
+flow from that drive to the Network panel, such as a media server
+streaming to a TV. A torrent client sharing and downloading on the same
+drive shows both.
 
 Without root, only your own processes can be inspected; the footer says so.
 Run `sudo disktop` to see everything. Flows under 512 KiB/s are left out,
@@ -115,7 +119,6 @@ and per-disk I/O are read from `/sys` and `/proc/diskstats`, and flows from
 
 - Detect more arrays: Storage Spaces on Windows; md, LVM and ZFS on Linux
 - Detect real flows on Windows (ETW)
-- Show uploads: data read from a drive and sent over the network
 - Focus mode to highlight one flow and dim the rest
 - Per-process view of who is hitting each drive
 - Keyboard controls for interval, layout and hiding drives
