@@ -623,7 +623,7 @@ mod tests {
     fn demo_app_at(t: f64) -> App {
         let mut demo = Demo::new();
         demo.advance_to(t);
-        App::new(Box::new(demo), Duration::from_secs(1), None)
+        App::new(Box::new(demo), Duration::from_secs(1), None, 20)
     }
 
     /// Draws `frames` frames, stepping the flows between them as the app does.
@@ -803,7 +803,7 @@ mod snapshot {
 
         let mut demo = crate::demo::Demo::new();
         demo.advance_to(at);
-        let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1), None);
+        let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1), None, 20);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         for _ in 0..120 {
             let mut lengths = Vec::new();

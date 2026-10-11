@@ -81,6 +81,7 @@ disktop                 # sample once a second
 disktop --interval 250  # sample every 250 ms (minimum 100)
 disktop --demo          # made-up arrays and copies, to see the flow view
 disktop --dot-size 1M   # make every flow dot stand for 1 MiB
+disktop --fps 10        # fewer animation frames, for slow terminals
 ```
 
 | Key | Action |
