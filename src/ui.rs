@@ -32,6 +32,8 @@ const TRACK_COLORS: [Color; 5] = [
 ];
 /// Most flows listed under the panels.
 const MAX_LISTED_FLOWS: usize = 4;
+/// The flow list's route column is at least this wide, so it rarely changes.
+const MIN_ROUTE_WIDTH: usize = 28;
 /// Distance between the dots that draw a track, in cells.
 const TRACK_STEP: f64 = 0.5;
 /// How far behind each dot its tail sits, in cells.
@@ -241,8 +243,8 @@ fn capacity_gauge(group: &Group) -> LineGauge<'static> {
     let label = format!(
         "{:>3.0}% {} / {}",
         ratio * 100.0,
-        format::bytes(group.used_space() as f64),
-        format::bytes(group.total_space as f64),
+        format::bytes_fixed(group.used_space() as f64),
+        format::bytes_fixed(group.total_space as f64),
     );
 
     LineGauge::default()
@@ -259,13 +261,13 @@ fn rates_line(current: Rate, peak: f64) -> Line<'static> {
         rate_span("read", current.read, READ_COLOR),
         "   ".into(),
         rate_span("write", current.write, WRITE_COLOR),
-        format!("   peak {}", format::rate(peak)).dark_gray(),
+        format!("   peak {}", format::rate_fixed(peak)).dark_gray(),
     ])
 }
 
 fn rate_span(name: &str, bytes_per_sec: f64, color: Color) -> Span<'static> {
     Span::styled(
-        format!("● {name} {}", format::rate(bytes_per_sec)),
+        format!("● {name} {}", format::rate_fixed(bytes_per_sec)),
         Style::new().fg(color),
     )
 }
@@ -470,14 +472,26 @@ fn draw_flow_list(frame: &mut Frame, area: Rect, flows: &[ListedFlow], groups: &
             .map_or_else(|| id.to_string(), |g| g.title.clone())
     };
 
-    let mut lines = vec![Line::from(" flows".dark_gray())];
     let shown = flows.len().min(MAX_LISTED_FLOWS);
-    for (i, flow) in flows.iter().take(shown).enumerate() {
-        let route = format!("{} → {}", title_of(&flow.from), title_of(&flow.to));
+    let routes: Vec<String> = flows
+        .iter()
+        .take(shown)
+        .map(|f| format!("{} → {}", title_of(&f.from), title_of(&f.to)))
+        .collect();
+    // One width for the whole list, so the rate column lines up on every row.
+    let route_width = routes
+        .iter()
+        .map(|r| r.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(MIN_ROUTE_WIDTH);
+
+    let mut lines = vec![Line::from(" flows".dark_gray())];
+    for (i, (flow, route)) in flows.iter().zip(&routes).enumerate() {
         let mut spans = vec![
             Span::styled(" ━━▶ ", Style::new().fg(flow.color)),
-            format!("{route:<28}").into(),
-            format!("{:>12}", format::rate(flow.rate)).bold(),
+            format!("{route:<route_width$} ").into(),
+            format::rate_fixed(flow.rate).bold(),
             format!("   {}", flow.process).dark_gray(),
         ];
         if i == shown - 1 && flows.len() > shown {
@@ -531,6 +545,41 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn numbers_keep_their_columns_as_values_change() {
+        let values = [0.0, 821.0, 39.3 * 1024.0 * 1024.0, 553.5e6, 1.7e9];
+        let layouts: Vec<(Option<usize>, Option<usize>, usize)> = values
+            .iter()
+            .flat_map(|&read| values.iter().map(move |&write| (read, write)))
+            .map(|(read, write)| {
+                let line = text(&rates_line(Rate { read, write }, read.max(write)));
+                (
+                    line.find("● write"),
+                    line.find("peak"),
+                    line.chars().count(),
+                )
+            })
+            .collect();
+        assert!(layouts.windows(2).all(|w| w[0] == w[1]), "{layouts:?}");
+    }
+
+    #[test]
+    fn header_stays_put_as_rates_change() {
+        let header_at = |t: f64| {
+            let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            animate(&mut terminal, &mut demo_app_at(t), 1);
+            let line = screen(&terminal)[0].clone();
+            (line.find("● write"), line.find("demo"))
+        };
+        // Idle, a slow copy, and two fast ones at once.
+        assert_eq!(header_at(59.5), header_at(10.0));
+        assert_eq!(header_at(10.0), header_at(23.0));
     }
 
     #[test]
@@ -596,9 +645,18 @@ mod snapshot {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let width = std::env::var("COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(160);
-        let height = std::env::var("ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-        let at = std::env::var("AT").ok().and_then(|v| v.parse().ok()).unwrap_or(23.0);
+        let width = std::env::var("COLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160);
+        let height = std::env::var("ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let at = std::env::var("AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(23.0);
 
         let mut demo = crate::demo::Demo::new();
         demo.advance_to(at);
@@ -606,7 +664,9 @@ mod snapshot {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         for _ in 0..120 {
             let mut lengths = Vec::new();
-            terminal.draw(|frame| lengths = super::draw(frame, &app)).unwrap();
+            terminal
+                .draw(|frame| lengths = super::draw(frame, &app))
+                .unwrap();
             app.field.set_lengths(&lengths);
             app.field.step(0.033);
         }
