@@ -37,10 +37,22 @@ its read and write rates, and labeled with the process name. Files are
 traced to a drive through the process's own mount table, so programs in
 containers are covered too.
 
+Downloads work the same way. A **Network** panel shows data in and out
+across the machine's hardware network interfaces. When a process writes to
+a drive more than it read from other drives, while connected to another
+machine, the rest came from the network, and it's drawn as a flow from the
+Network panel to that drive. It's never bigger than what the process's
+network actually received (its container's own interface, or the
+machine's), so a program writing its own database or logs isn't mistaken
+for a download.
+
 Without root, only your own processes can be inspected; the footer says so.
 Run `sudo disktop` to see everything. Flows under 512 KiB/s are left out,
 and so is a process reading and writing the same drive, which is usually a
 database or a log rather than a copy.
+
+The list of flows under the panels keeps its height once it has appeared,
+so the panels above don't jump as copies start and stop.
 
 ## Install
 
@@ -103,7 +115,7 @@ and per-disk I/O are read from `/sys` and `/proc/diskstats`, and flows from
 
 - Detect more arrays: Storage Spaces on Windows; md, LVM and ZFS on Linux
 - Detect real flows on Windows (ETW)
-- Show copies arriving over the network, which have no source drive
+- Show uploads: data read from a drive and sent over the network
 - Focus mode to highlight one flow and dim the rest
 - Per-process view of who is hitting each drive
 - Keyboard controls for interval, layout and hiding drives

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use sysinfo::{Disk, DiskKind, Disks};
 
-use crate::model::{Flow, Group, GroupKind, History, Member, Rate, Source};
+use crate::model::{Flow, Group, GroupKind, History, Member, NETWORK, Rate, Source};
 use crate::procio::{DeviceGroups, ProcFlows};
 use crate::sysfs::{self, Btrfs};
 
@@ -13,6 +13,7 @@ use crate::sysfs::{self, Btrfs};
 const SYS: &str = "/sys";
 const PROC: &str = "/proc";
 const DISKSTATS: &str = "/proc/diskstats";
+const NET_DEV: &str = "/proc/net/dev";
 
 /// Cumulative (bytes read, bytes written) counters, keyed by what they count.
 type Counters = HashMap<String, (u64, u64)>;
@@ -71,7 +72,8 @@ impl DriveMonitor {
         };
         monitor.rebuild(None);
         // Take a first reading so the next sample has something to compare.
-        monitor.tracer.sample(None, &monitor.devices);
+        let hardware = sysfs::physical_interfaces(Path::new(SYS));
+        monitor.tracer.sample(None, &monitor.devices, &hardware);
         monitor
     }
 
@@ -178,10 +180,50 @@ impl DriveMonitor {
             self.groups.push(group);
         }
 
+        self.groups.sort_by(|a, b| a.id.cmp(&b.id));
+        // The network goes first, so it sits at the top of a column.
+        if let Some(network) = network_group(previous.remove(NETWORK), &sample, &mut counters) {
+            self.groups.insert(0, network);
+        }
         self.counters = counters;
         self.devices = devices;
-        self.groups.sort_by(|a, b| a.id.cmp(&b.id));
     }
+}
+
+/// The machine's network connection: data in and out across its hardware
+/// interfaces. `None` where that can't be read, such as off Linux.
+fn network_group(old: Option<Group>, sample: &Sample, counters: &mut Counters) -> Option<Group> {
+    let interfaces = sysfs::physical_interfaces(Path::new(SYS));
+    if interfaces.is_empty() {
+        return None;
+    }
+    let stats = sysfs::parse_net_dev(&std::fs::read_to_string(NET_DEV).ok()?);
+    let now = interfaces
+        .iter()
+        .filter_map(|name| stats.get(name))
+        .fold((0, 0), |(rx, tx), &(r, t)| (rx + r, tx + t));
+
+    let mut history = old
+        .and_then(|g| g.members.into_iter().next())
+        .map(|m| m.history)
+        .unwrap_or_default();
+    if let Some(rate) = sample.rate("net", now, counters) {
+        history.push(rate);
+    }
+    Some(Group {
+        id: NETWORK.to_string(),
+        title: "Network".to_string(),
+        details: interfaces,
+        kind: GroupKind::Network,
+        total_space: 0,
+        available_space: 0,
+        members: vec![Member {
+            name: String::new(),
+            details: String::new(),
+            history,
+        }],
+        physical_disks: Vec::new(),
+    })
 }
 
 impl Source for DriveMonitor {
@@ -194,7 +236,8 @@ impl Source for DriveMonitor {
 
         self.disks.refresh(true);
         self.rebuild(Some(elapsed));
-        self.flows = self.tracer.sample(Some(elapsed), &self.devices);
+        let hardware = sysfs::physical_interfaces(Path::new(SYS));
+        self.flows = self.tracer.sample(Some(elapsed), &self.devices, &hardware);
     }
 
     fn groups(&self) -> &[Group] {

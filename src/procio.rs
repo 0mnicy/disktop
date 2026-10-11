@@ -7,15 +7,22 @@
 //! through the mount they're on, using the process's own mount table, so
 //! programs inside containers map to the right drive too.
 //!
+//! Downloads show up the same way: a process writing to a drive more than
+//! it read from other drives, while connected to another machine, got the
+//! rest from the network. That becomes a flow from the network panel, but
+//! never bigger than what the process's network actually received, since
+//! programs also write things they made themselves, like databases and logs.
+//!
 //! Without root this only sees processes run by the same user. Paths are
 //! rooted at a parameter so tests can use a fake tree; where `/proc` doesn't
 //! exist nothing is found.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::model::Flow;
+use crate::model::{Flow, NETWORK};
+use crate::sysfs;
 
 /// Copies slower than this aren't shown, so logs and databases ticking
 /// over don't clutter the screen.
@@ -31,6 +38,8 @@ struct Seen {
     written: u64,
     /// File offsets by descriptor, to weigh which files moved the data.
     positions: HashMap<u32, u64>,
+    /// Bytes its network had received, read while it was writing.
+    received: Option<u64>,
 }
 
 /// One open file that counts towards a process's reads or writes.
@@ -40,6 +49,14 @@ struct OpenFile {
     writes: bool,
     /// Bytes this descriptor's offset moved since last time.
     moved: u64,
+}
+
+/// What a process has open: files on known drives, and the inode numbers
+/// of descriptors that aren't files on any mount (sockets, pipes and such).
+#[derive(Debug, Default)]
+struct Opened {
+    files: Vec<OpenFile>,
+    sockets: HashSet<u64>,
 }
 
 pub struct ProcFlows {
@@ -61,7 +78,13 @@ impl ProcFlows {
     }
 
     /// The flows between groups since the last call, `elapsed_secs` ago.
-    pub fn sample(&mut self, elapsed_secs: Option<f64>, devices: &DeviceGroups) -> Vec<Flow> {
+    /// `hardware` names the machine's physical network interfaces.
+    pub fn sample(
+        &mut self,
+        elapsed_secs: Option<f64>,
+        devices: &DeviceGroups,
+        hardware: &[String],
+    ) -> Vec<Flow> {
         let Ok(entries) = fs::read_dir(&self.proc) else {
             return Vec::new();
         };
@@ -86,6 +109,7 @@ impl ProcFlows {
                 read,
                 written,
                 positions: HashMap::new(),
+                received: None,
             };
 
             if let (Some(elapsed), Some(before)) = (elapsed_secs, previous)
@@ -93,13 +117,37 @@ impl ProcFlows {
             {
                 let read_rate = read.saturating_sub(before.read) as f64 / elapsed;
                 let write_rate = written.saturating_sub(before.written) as f64 / elapsed;
-                if read_rate.min(write_rate) >= MIN_FLOW_RATE {
-                    let files = open_files(&dir, devices, &before.positions, &mut now.positions);
+                if write_rate >= MIN_FLOW_RATE {
+                    now.received =
+                        read_text(&dir.join("net/dev")).map(|text| received(&text, hardware));
+                    let opened = open_files(&dir, devices, &before.positions, &mut now.positions);
                     let process = read_text(&dir.join("comm"))
                         .map(|c| c.trim().to_string())
                         .unwrap_or_else(|| pid.to_string());
-                    for (from, to, rate) in attribute(&files, read_rate.min(write_rate)) {
+
+                    let copy_rate = read_rate.min(write_rate);
+                    let copies = if copy_rate >= MIN_FLOW_RATE {
+                        attribute(&opened.files, copy_rate)
+                    } else {
+                        Vec::new()
+                    };
+                    let copied: f64 = copies.iter().map(|(_, _, rate)| rate).sum();
+                    for (from, to, rate) in copies {
                         add_flow(&mut flows, from, to, rate, &process);
+                    }
+
+                    // Whatever it wrote that didn't come from another drive
+                    // came from the network, if it's talking to one, up to
+                    // what its network received.
+                    let network_rate = match (before.received, now.received) {
+                        (Some(before), Some(now)) => now.saturating_sub(before) as f64 / elapsed,
+                        _ => 0.0,
+                    };
+                    let downloaded = (write_rate - copied).min(network_rate);
+                    if downloaded >= MIN_FLOW_RATE && connected(&dir, &opened.sockets) {
+                        for (to, share) in shares(&opened.files, true) {
+                            add_flow(&mut flows, NETWORK.into(), to, downloaded * share, &process);
+                        }
                     }
                 }
             }
@@ -133,20 +181,21 @@ fn add_flow(flows: &mut Vec<Flow>, from: String, to: String, rate: f64, process:
 }
 
 /// The process's open files on known drives, with how far each one's
-/// offset moved since last time. Records the new offsets in `positions`.
+/// offset moved since last time, and its sockets. Records the new offsets
+/// in `positions`.
 fn open_files(
     dir: &Path,
     devices: &DeviceGroups,
     before: &HashMap<u32, u64>,
     positions: &mut HashMap<u32, u64>,
-) -> Vec<OpenFile> {
+) -> Opened {
     let Some(mounts) = read_text(&dir.join("mountinfo")).map(|t| parse_mountinfo(&t)) else {
-        return Vec::new();
+        return Opened::default();
     };
     let Ok(entries) = fs::read_dir(dir.join("fdinfo")) else {
-        return Vec::new();
+        return Opened::default();
     };
-    let mut files = Vec::new();
+    let mut opened = Opened::default();
     for entry in entries.flatten() {
         let Some(fd) = entry
             .file_name()
@@ -158,25 +207,83 @@ fn open_files(
         let Some(info) = read_text(&entry.path()).and_then(|t| parse_fdinfo(&t)) else {
             continue;
         };
-        // Sockets, pipes and the like sit on mounts that aren't listed, and
-        // files on /proc or tmpfs don't map to a drive, so both drop out here.
-        let Some(group) = mounts
-            .get(&info.mount_id)
-            .and_then(|source| devices.get(&kernel_name(source)))
-        else {
+        // Sockets, pipes and the like sit on mounts that aren't listed.
+        let Some(source) = mounts.get(&info.mount_id) else {
+            opened.sockets.extend(info.inode);
+            continue;
+        };
+        // Files on /proc, tmpfs and the like don't map to a drive.
+        let Some(group) = devices.get(&kernel_name(source)) else {
             continue;
         };
         positions.insert(fd, info.position);
         let moved = before
             .get(&fd)
             .map_or(0, |&old| info.position.saturating_sub(old));
-        files.push(OpenFile {
+        opened.files.push(OpenFile {
             group: group.clone(),
             writes: info.writes,
             moved,
         });
     }
-    files
+    opened
+}
+
+/// Bytes received on the network a process sees, from its `net/dev`. A
+/// process outside any container sees the host's interfaces, and only the
+/// hardware ones count, so traffic between local containers isn't taken for
+/// downloads. A process in a container sees only its own virtual interface,
+/// and that counts.
+fn received(text: &str, hardware: &[String]) -> u64 {
+    let stats = sysfs::parse_net_dev(text);
+    let on_hardware: Vec<u64> = hardware
+        .iter()
+        .filter_map(|name| stats.get(name))
+        .map(|&(rx, _)| rx)
+        .collect();
+    if on_hardware.is_empty() {
+        stats
+            .iter()
+            .filter(|(name, _)| name.as_str() != "lo")
+            .map(|(_, &(rx, _))| rx)
+            .sum()
+    } else {
+        on_hardware.iter().sum()
+    }
+}
+
+/// Whether any of the process's sockets is a TCP connection to another
+/// machine. Listening sockets and loopback connections don't count, so a
+/// program talking only to itself or its neighbours on the box is left out.
+fn connected(dir: &Path, sockets: &HashSet<u64>) -> bool {
+    !sockets.is_empty()
+        && ["net/tcp", "net/tcp6"].iter().any(|table| {
+            read_text(&dir.join(table)).is_some_and(|text| {
+                parse_tcp(&text)
+                    .iter()
+                    .any(|s| s.established && !s.loopback && sockets.contains(&s.inode))
+            })
+        })
+}
+
+/// The group shares on one side of a process's open files: how the bytes
+/// it read (or wrote) divide between drives.
+fn shares(files: &[OpenFile], writes: bool) -> Vec<(String, f64)> {
+    let side: Vec<&OpenFile> = files.iter().filter(|f| f.writes == writes).collect();
+    let total_moved: u64 = side.iter().map(|f| f.moved).sum();
+    let mut shares: Vec<(String, f64)> = Vec::new();
+    for file in &side {
+        let weight = if total_moved > 0 {
+            file.moved as f64 / total_moved as f64
+        } else {
+            1.0 / side.len() as f64
+        };
+        match shares.iter_mut().find(|(g, _)| *g == file.group) {
+            Some((_, share)) => *share += weight,
+            None => shares.push((file.group.clone(), weight)),
+        }
+    }
+    shares
 }
 
 /// Splits `rate` across every pair of a group read from and a different
@@ -184,25 +291,8 @@ fn open_files(
 /// When offsets don't move (programs using positioned reads and writes),
 /// each open file counts equally.
 fn attribute(files: &[OpenFile], rate: f64) -> Vec<(String, String, f64)> {
-    let shares = |writes: bool| -> Vec<(String, f64)> {
-        let side: Vec<&OpenFile> = files.iter().filter(|f| f.writes == writes).collect();
-        let total_moved: u64 = side.iter().map(|f| f.moved).sum();
-        let mut shares: Vec<(String, f64)> = Vec::new();
-        for file in &side {
-            let weight = if total_moved > 0 {
-                file.moved as f64 / total_moved as f64
-            } else {
-                1.0 / side.len() as f64
-            };
-            match shares.iter_mut().find(|(g, _)| *g == file.group) {
-                Some((_, share)) => *share += weight,
-                None => shares.push((file.group.clone(), weight)),
-            }
-        }
-        shares
-    };
-    let reads = shares(false);
-    let writes = shares(true);
+    let reads = shares(files, false);
+    let writes = shares(files, true);
 
     let mut flows = Vec::new();
     for (from, read_share) in &reads {
@@ -234,6 +324,8 @@ struct FdInfo {
     /// Opened for writing (write-only or read-write).
     writes: bool,
     mount_id: u32,
+    /// For a socket, the number its TCP table entry is listed under.
+    inode: Option<u64>,
 }
 
 /// The parts of `/proc/<pid>/fdinfo/<fd>` that matter here.
@@ -249,7 +341,48 @@ fn parse_fdinfo(text: &str) -> Option<FdInfo> {
         // The low two bits are the access mode: 0 read-only, 1 write-only, 2 both.
         writes: flags & 0o3 != 0,
         mount_id: field("mnt_id:")?.parse().ok()?,
+        inode: field("ino:").and_then(|v| v.parse().ok()),
     })
+}
+
+/// One row of `/proc/<pid>/net/tcp` or `tcp6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpSocket {
+    established: bool,
+    /// The far end is this machine (127.x.x.x or ::1).
+    loopback: bool,
+    inode: u64,
+}
+
+/// Rows of a TCP table. Addresses are hex in the kernel's byte order, so
+/// 127.0.0.1 reads `0100007F`; state `01` is established.
+fn parse_tcp(text: &str) -> Vec<TcpSocket> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let remote = fields.get(2)?.split(':').next()?;
+            Some(TcpSocket {
+                established: *fields.get(3)? == "01",
+                loopback: is_loopback(remote),
+                inode: fields.get(9)?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn is_loopback(hex: &str) -> bool {
+    let hex = hex.to_ascii_uppercase();
+    match hex.len() {
+        // IPv4: the first octet comes last.
+        8 => hex.ends_with("7F"),
+        // IPv6: ::1, or an IPv4 address mapped as ::ffff:127.x.x.x.
+        32 => {
+            hex == "00000000000000000000000001000000"
+                || (hex.starts_with("0000000000000000FFFF0000") && hex.ends_with("7F"))
+        }
+        _ => false,
+    }
 }
 
 /// Mount ID → mount source from `/proc/<pid>/mountinfo`. A line looks like
@@ -300,7 +433,8 @@ mod tests {
             Some(FdInfo {
                 position: MIB,
                 writes: false,
-                mount_id: 36
+                mount_id: 36,
+                inode: Some(42),
             })
         );
         let write_only = "pos:\t0\nflags:\t0101101\nmnt_id:\t40\n";
@@ -364,6 +498,26 @@ mod tests {
         let files = [file("/main", false, 0), file("/main", true, 0)];
         assert!(attribute(&files, 100.0).is_empty());
         assert!(attribute(&[file("/main", false, 0)], 100.0).is_empty());
+    }
+
+    #[test]
+    fn tcp_tables_show_remote_connections() {
+        let tcp = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:2328 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1
+   1: 0100007F:A1B2 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 222 1
+   2: 0A00000A:C350 2E1B0A5D:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 333 1
+";
+        let sockets = parse_tcp(tcp);
+        assert_eq!(sockets.len(), 3);
+        assert!(!sockets[0].established, "listening");
+        assert!(sockets[1].established && sockets[1].loopback);
+        assert!(sockets[2].established && !sockets[2].loopback);
+        assert_eq!(sockets[2].inode, 333);
+
+        assert!(is_loopback("00000000000000000000000001000000"));
+        assert!(is_loopback("0000000000000000FFFF00000100007F"));
+        assert!(!is_loopback("20010DB8000000000000000000000001"));
     }
 
     #[test]
@@ -431,6 +585,130 @@ mod tests {
         }
     }
 
+    impl FakeProc {
+        /// A process writing `progress` bytes to /main, with `received`
+        /// bytes arrived on its container's network over a TCP connection
+        /// (fd 7, inode 333), while also reading `seeding` bytes from /main
+        /// for someone else.
+        fn downloader(&self, pid: u32, progress: u64, received: u64, seeding: u64, remote: bool) {
+            self.write(
+                &format!("{pid}/net/dev"),
+                &format!(
+                    "Inter-|\n face |\n    lo: 500 1 0 0 0 0 0 0 500 1 0 0 0 0 0 0\n  eth0: {received} 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0\n"
+                ),
+            );
+            self.write(&format!("{pid}/comm"), "qbittorrent\n");
+            self.write(
+                &format!("{pid}/io"),
+                &format!("read_bytes: {seeding}\nwrite_bytes: {progress}\n"),
+            );
+            self.write(
+                &format!("{pid}/mountinfo"),
+                "36 29 0:45 / /downloads rw - btrfs /dev/sdb rw\n",
+            );
+            self.write(
+                &format!("{pid}/fdinfo/5"),
+                "pos:\t0\nflags:\t0100002\nmnt_id:\t36\n",
+            );
+            self.write(
+                &format!("{pid}/fdinfo/6"),
+                "pos:\t0\nflags:\t0100000\nmnt_id:\t36\n",
+            );
+            self.write(
+                &format!("{pid}/fdinfo/7"),
+                "pos:\t0\nflags:\t02\nmnt_id:\t9\nino:\t333\n",
+            );
+            let far_end = if remote {
+                "2E1B0A5D:01BB"
+            } else {
+                "0100007F:1F90"
+            };
+            self.write(
+                &format!("{pid}/net/tcp"),
+                &format!(
+                    "  sl  local_address rem_address   st\n   0: 0A00000A:C350 {far_end} 01 0 0 0 0 0 333 1\n"
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn a_download_is_a_flow_from_the_network() {
+        let proc = FakeProc::new("download");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.downloader(77, 0, 0, 0, true);
+        tracer.sample(None, &devices, &[]);
+        // A first second of writing, to learn what its network had received.
+        proc.downloader(77, 10 * MIB, 10 * MIB, 0, true);
+        tracer.sample(Some(1.0), &devices, &[]);
+        // 50 MiB/s down while seeding 30 MiB/s from the same drive: reading
+        // the drive it writes to isn't a copy, so all 50 came from outside.
+        proc.downloader(77, 60 * MIB, 60 * MIB, 30 * MIB, true);
+        let flows = tracer.sample(Some(1.0), &devices, &[]);
+        assert_eq!(
+            flows,
+            vec![Flow {
+                from: NETWORK.into(),
+                to: "/main".into(),
+                rate: (50 * MIB) as f64,
+                process: "qbittorrent".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn writing_while_talking_only_to_loopback_is_not_a_download() {
+        let proc = FakeProc::new("loopback");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.downloader(78, 0, 0, 0, false);
+        tracer.sample(None, &devices, &[]);
+        proc.downloader(78, 10 * MIB, 10 * MIB, 0, false);
+        tracer.sample(Some(1.0), &devices, &[]);
+        proc.downloader(78, 60 * MIB, 60 * MIB, 0, false);
+        assert!(tracer.sample(Some(1.0), &devices, &[]).is_empty());
+    }
+
+    #[test]
+    fn writing_more_than_the_network_received_is_capped() {
+        // A program writing its own database while trickling a little over
+        // the network: only what actually arrived counts as downloaded.
+        let proc = FakeProc::new("database");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.downloader(79, 0, 0, 0, true);
+        tracer.sample(None, &devices, &[]);
+        proc.downloader(79, 10 * MIB, 20 * 1024, 0, true);
+        tracer.sample(Some(1.0), &devices, &[]);
+        proc.downloader(79, 20 * MIB, 40 * 1024, 0, true);
+        assert!(tracer.sample(Some(1.0), &devices, &[]).is_empty());
+    }
+
+    #[test]
+    fn host_processes_count_only_hardware_interfaces() {
+        let text = "Inter-|\n face |\n    lo: 900 0 0 0 0 0 0 0 900 0 0 0 0 0 0 0\n  eno1: 100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\ndocker0: 5000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(received(text, &["eno1".to_string()]), 100);
+        // In a container there's no hardware interface, so everything but
+        // loopback counts.
+        assert_eq!(received(text, &[]), 5100);
+    }
+
+    #[test]
+    fn a_copy_is_not_also_counted_as_a_download() {
+        // The copier has no sockets, but even with one the copied bytes are
+        // explained by the source drive, leaving nothing for the network.
+        let proc = FakeProc::new("copy-not-download");
+        let devices = god_server_devices();
+        let mut tracer = ProcFlows::new(&proc.0);
+        proc.copier(4243, "rsync", 0);
+        tracer.sample(None, &devices, &[]);
+        proc.copier(4243, "rsync", 80 * MIB);
+        let flows = tracer.sample(Some(1.0), &devices, &[]);
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].from, "/main");
+    }
+
     fn god_server_devices() -> DeviceGroups {
         [("sdb", "/main"), ("mpathh-part1", "/mnt/MediaArchive3")]
             .into_iter()
@@ -446,12 +724,12 @@ mod tests {
 
         proc.copier(4242, "Sonarr", 100 * MIB);
         assert!(
-            tracer.sample(None, &devices).is_empty(),
+            tracer.sample(None, &devices, &[]).is_empty(),
             "nothing to compare yet"
         );
 
         proc.copier(4242, "Sonarr", 300 * MIB);
-        let flows = tracer.sample(Some(2.0), &devices);
+        let flows = tracer.sample(Some(2.0), &devices, &[]);
         assert_eq!(
             flows,
             vec![Flow {
@@ -469,10 +747,10 @@ mod tests {
         let devices = god_server_devices();
         let mut tracer = ProcFlows::new(&proc.0);
         proc.copier(1, "trickle", 0);
-        tracer.sample(None, &devices);
+        tracer.sample(None, &devices, &[]);
         proc.copier(1, "trickle", 100 * 1024);
         assert!(
-            tracer.sample(Some(1.0), &devices).is_empty(),
+            tracer.sample(Some(1.0), &devices, &[]).is_empty(),
             "under the minimum"
         );
 
@@ -481,13 +759,17 @@ mod tests {
             "1/io",
             &format!("read_bytes: {}\nwrite_bytes: {}\n", 900 * MIB, 100 * 1024),
         );
-        assert!(tracer.sample(Some(1.0), &devices).is_empty());
+        assert!(tracer.sample(Some(1.0), &devices, &[]).is_empty());
     }
 
     #[test]
     fn missing_proc_finds_nothing() {
         let mut tracer = ProcFlows::new("/definitely/not/proc");
-        assert!(tracer.sample(Some(1.0), &DeviceGroups::new()).is_empty());
+        assert!(
+            tracer
+                .sample(Some(1.0), &DeviceGroups::new(), &[])
+                .is_empty()
+        );
         assert!(!tracer.sees_everything());
     }
 }

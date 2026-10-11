@@ -21,6 +21,9 @@ pub struct App {
     pub interval: Duration,
     pub show_flows: bool,
     pub paused: bool,
+    /// Rows kept for the flow list. It grows to fit the most flows seen and
+    /// never shrinks, so the panels above don't jump as copies come and go.
+    pub flow_list_rows: u16,
     should_quit: bool,
 }
 
@@ -28,14 +31,22 @@ impl App {
     pub fn new(source: Box<dyn Source>, interval: Duration, dot_size: Option<f64>) -> Self {
         let mut field = FlowField::new(dot_size);
         field.sync(source.flows());
-        Self {
+        let mut app = Self {
             source,
             field,
             interval,
             show_flows: true,
             paused: false,
+            flow_list_rows: 0,
             should_quit: false,
-        }
+        };
+        app.fit_flow_list();
+        app
+    }
+
+    /// Grows the flow list to fit the flows running now.
+    fn fit_flow_list(&mut self) {
+        self.flow_list_rows = self.flow_list_rows.max(ui::flow_list_rows(&self.field));
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -64,6 +75,7 @@ impl App {
             if !self.paused && now >= next_sample {
                 self.source.sample();
                 self.field.sync(self.source.flows());
+                self.fit_flow_list();
                 next_sample = now + self.interval;
             }
             let dt = now

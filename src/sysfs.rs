@@ -194,6 +194,35 @@ fn parent_disk(class: &Path, device: &str) -> String {
     }
 }
 
+/// Network interfaces backed by real hardware, from `<sys>/class/net`.
+/// Loopback, Docker bridges, VPN tunnels and the like have no `device`
+/// link, so they're left out and only traffic in and out of the machine
+/// is counted.
+pub fn physical_interfaces(sys: &Path) -> Vec<String> {
+    let class = sys.join("class/net");
+    names_in(&class)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| class.join(name).join("device").exists())
+        .collect()
+}
+
+/// Cumulative (bytes received, bytes sent) per interface, from
+/// `/proc/net/dev`. After the interface name come eight receive counters,
+/// bytes first, then eight transmit counters, bytes first.
+pub fn parse_net_dev(text: &str) -> HashMap<String, (u64, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let (name, counters) = line.split_once(':')?;
+            let fields: Vec<u64> = counters
+                .split_whitespace()
+                .map(|v| v.parse().ok())
+                .collect::<Option<_>>()?;
+            Some((name.trim().to_string(), (*fields.first()?, *fields.get(8)?)))
+        })
+        .collect()
+}
+
 /// Names in a directory, in natural order (`sdb` before `sdaa`), or `None`
 /// when it can't be read.
 fn names_in(dir: &Path) -> Option<Vec<String>> {
@@ -365,6 +394,31 @@ mod tests {
             .file("class/block/sdb1/partition", "1\n")
             .file("class/block/sdc1/partition", "1\n");
         assert_eq!(physical_disks(&sys.0, "dm-0"), vec!["sdb", "sdc"]);
+    }
+
+    #[test]
+    fn only_hardware_interfaces_count() {
+        let sys = FakeSys::new("net");
+        sys.file("class/net/eno1/device/vendor", "0x8086\n")
+            .file("class/net/enx520ca68ccd19/device/vendor", "0x0bda\n")
+            .dir("class/net/lo")
+            .dir("class/net/docker0")
+            .dir("class/net/zt2ntbjb7x");
+        assert_eq!(physical_interfaces(&sys.0), vec!["eno1", "enx520ca68ccd19"]);
+    }
+
+    #[test]
+    fn net_dev_is_read_in_bytes() {
+        let text = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 38875646  1000    0    0    0     0          0         0 38875646  1000    0    0    0     0       0          0
+  eno1: 11792551396 9000000 0 12 0 0 0 4000 1595051087 3000000 0 0 0 0 0 0
+";
+        let stats = parse_net_dev(text);
+        assert_eq!(stats["eno1"], (11792551396, 1595051087));
+        assert_eq!(stats["lo"], (38875646, 38875646));
+        assert_eq!(stats.len(), 2);
     }
 
     #[test]

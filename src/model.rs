@@ -105,10 +105,17 @@ impl ArrayLayout {
     }
 }
 
+/// The id of the network panel, which flows use for data arriving from
+/// (or leaving for) the network.
+pub const NETWORK: &str = "network";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupKind {
     Standalone,
     Array(ArrayLayout),
+    /// The machine's network connection. Its one member's `read` is data
+    /// received and `write` is data sent.
+    Network,
 }
 
 /// One panel on screen.
@@ -135,7 +142,7 @@ pub struct Group {
 pub fn disk_count(groups: &[Group]) -> usize {
     let mut known: Vec<&str> = Vec::new();
     let mut unknown = 0;
-    for group in groups {
+    for group in groups.iter().filter(|g| !g.is_network()) {
         if group.physical_disks.is_empty() {
             unknown += group.members.len();
         } else {
@@ -166,6 +173,10 @@ impl Group {
 
     pub fn is_array(&self) -> bool {
         matches!(self.kind, GroupKind::Array(_))
+    }
+
+    pub fn is_network(&self) -> bool {
+        self.kind == GroupKind::Network
     }
 }
 
@@ -242,6 +253,8 @@ mod tests {
                 .collect(),
             physical_disks: disks.iter().map(|d| d.to_string()).collect(),
         };
+        let mut network = group(&[], 1);
+        network.kind = GroupKind::Network;
         let groups = [
             // `/` and `/boot/efi` on one NVMe.
             group(&["nvme1n1"], 1),
@@ -249,6 +262,8 @@ mod tests {
             group(&["sda", "sdb"], 2),
             // A volume whose disks aren't known counts its members.
             group(&[], 1),
+            // The network isn't a disk.
+            network,
         ];
         assert_eq!(disk_count(&groups), 4);
     }

@@ -51,8 +51,8 @@ const MIN_GRAPH_SCALE: f64 = 64.0 * 1024.0;
 pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
     let groups = app.source.groups();
     let listed = listed_flows(&app.field);
-    let list_rows = if app.show_flows && !listed.is_empty() {
-        listed.len().min(MAX_LISTED_FLOWS) as u16 + 1
+    let list_rows = if app.show_flows {
+        app.flow_list_rows
     } else {
         0
     };
@@ -79,6 +79,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
         match &group.kind {
             GroupKind::Standalone => draw_standalone(frame, panel.area, group),
             GroupKind::Array(array) => draw_array(frame, panel, group, array),
+            GroupKind::Network => draw_network(frame, panel.area, group),
         }
     }
 
@@ -95,7 +96,12 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let groups = app.source.groups();
-    let total: Rate = groups.iter().map(Group::current).sum();
+    // Disk totals: network traffic isn't disk I/O.
+    let total: Rate = groups
+        .iter()
+        .filter(|g| !g.is_network())
+        .map(Group::current)
+        .sum();
     let disks = model::disk_count(groups);
     let arrays = groups.iter().filter(|g| g.is_array()).count();
 
@@ -174,6 +180,28 @@ fn draw_standalone(frame: &mut Frame, area: Rect, group: &Group) {
     let samples = recent_samples(&member.history, graph);
     frame.render_widget(capacity_gauge(group), capacity);
     frame.render_widget(rates_line(member.history.current(), peak(&samples)), rates);
+    draw_graph(frame, graph, &member.history, &samples);
+}
+
+/// The network: data received and sent, with a graph, and no capacity.
+fn draw_network(frame: &mut Frame, area: Rect, group: &Group) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().dark_gray())
+        .title(group_title(group));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let [rates, graph] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    let Some(member) = group.members.first() else {
+        return;
+    };
+    let samples = recent_samples(&member.history, graph);
+    frame.render_widget(
+        labelled_rates_line(member.history.current(), peak(&samples), ["down", "up"]),
+        rates,
+    );
     draw_graph(frame, graph, &member.history, &samples);
 }
 
@@ -294,10 +322,16 @@ fn capacity_gauge(group: &Group) -> LineGauge<'static> {
 }
 
 fn rates_line(current: Rate, peak: f64) -> Line<'static> {
+    labelled_rates_line(current, peak, ["read", "write"])
+}
+
+/// A rates line with its own names for the two directions, such as
+/// `down` and `up` for the network.
+fn labelled_rates_line(current: Rate, peak: f64, names: [&str; 2]) -> Line<'static> {
     Line::from(vec![
-        rate_span("read", current.read, READ_COLOR),
+        rate_span(names[0], current.read, READ_COLOR),
         "   ".into(),
-        rate_span("write", current.write, WRITE_COLOR),
+        rate_span(names[1], current.write, WRITE_COLOR),
         format!("   peak {}", format::rate_fixed(peak)).dark_gray(),
     ])
 }
@@ -384,7 +418,7 @@ fn plan_routes(
             let to = index_of(&route.to)?;
             let target_copies = match &groups[to].kind {
                 GroupKind::Array(array) => array.copies,
-                GroupKind::Standalone => 1,
+                GroupKind::Standalone | GroupKind::Network => 1,
             };
             Some(RouteEnds {
                 from,
@@ -498,6 +532,17 @@ fn listed_flows(field: &FlowField) -> Vec<ListedFlow> {
     flows
 }
 
+/// Rows the flow list needs for the flows running now: a heading and a
+/// line per flow, up to a limit. None when nothing is running.
+pub fn flow_list_rows(field: &FlowField) -> u16 {
+    let running = field.routes().iter().filter(|r| r.running).count();
+    if running == 0 {
+        0
+    } else {
+        running.min(MAX_LISTED_FLOWS) as u16 + 1
+    }
+}
+
 fn draw_flow_list(
     frame: &mut Frame,
     area: Rect,
@@ -536,6 +581,12 @@ fn draw_flow_list(
         format::size_label(field.dot_size())
     );
     let mut lines = vec![Line::from(scale.dark_gray())];
+    if flows.is_empty() {
+        // The list keeps its space, so say why it's empty.
+        lines.push(Line::from(
+            " no copies between drives right now".dark_gray(),
+        ));
+    }
     for (i, (flow, route)) in flows.iter().zip(&routes).enumerate() {
         let mut spans = vec![
             Span::styled(" ━━▶ ", Style::new().fg(flow.color)),
@@ -685,6 +736,34 @@ mod tests {
                 .any(|l| l.contains("flows · each dot is 50 MiB")),
             "{:?}",
             lines.iter().find(|l| l.contains("flows"))
+        );
+    }
+
+    #[test]
+    fn panels_stay_put_when_flows_stop() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        let mut app = demo_app_at(10.0);
+        animate(&mut terminal, &mut app, 1);
+        let busy = screen(&terminal);
+
+        // Every copy stops: the list keeps its rows and says so.
+        app.field.sync(&[]);
+        animate(&mut terminal, &mut app, 1);
+        let quiet = screen(&terminal);
+
+        let panel_tops = |lines: &[String]| -> Vec<usize> {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with('╭'))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(panel_tops(&busy), panel_tops(&quiet));
+        assert!(
+            quiet
+                .iter()
+                .any(|l| l.contains("no copies between drives right now"))
         );
     }
 

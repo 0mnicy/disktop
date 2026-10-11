@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use crate::model::{ArrayLayout, Flow, Group, GroupKind, History, Member, Rate, Source};
+use crate::model::{ArrayLayout, Flow, Group, GroupKind, History, Member, NETWORK, Rate, Source};
 
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
@@ -25,7 +25,7 @@ struct ScriptedFlow {
     process: &'static str,
 }
 
-const SCRIPT: [ScriptedFlow; 4] = [
+const SCRIPT: [ScriptedFlow; 5] = [
     ScriptedFlow {
         from: "D:\\",
         to: "M:\\",
@@ -57,6 +57,14 @@ const SCRIPT: [ScriptedFlow; 4] = [
         end: 58.0,
         rate: 350.0 * MIB,
         process: "resolve.exe",
+    },
+    ScriptedFlow {
+        from: NETWORK,
+        to: "D:\\",
+        start: 8.0,
+        end: 40.0,
+        rate: 45.0 * MIB,
+        process: "qbittorrent.exe",
     },
 ];
 
@@ -209,7 +217,7 @@ fn ramp(t: f64, start: f64, end: f64) -> f64 {
 fn spread(kind: &GroupKind, members: &mut [Rate], rate: f64, direction: Direction) {
     let count = members.len().max(1);
     let per_member = match (kind, direction) {
-        (GroupKind::Standalone, _) => rate,
+        (GroupKind::Standalone | GroupKind::Network, _) => rate,
         (GroupKind::Array(layout), Direction::Write) => {
             rate * layout.copies.min(count) as f64 / count as f64
         }
@@ -225,6 +233,7 @@ fn spread(kind: &GroupKind, members: &mut [Rate], rate: f64, direction: Directio
 
 fn demo_groups() -> Vec<Group> {
     vec![
+        network(),
         standalone("C:\\", &["System", "NTFS", "SSD"], TB, 0.62),
         standalone("D:\\", &["Games", "NTFS", "SSD"], 2 * TB, 0.71),
         array(
@@ -253,6 +262,23 @@ fn demo_groups() -> Vec<Group> {
         ),
         standalone("E:\\", &["Backup", "exFAT", "removable"], TB, 0.40),
     ]
+}
+
+fn network() -> Group {
+    Group {
+        id: NETWORK.to_string(),
+        title: "Network".to_string(),
+        details: vec!["Ethernet".to_string()],
+        kind: GroupKind::Network,
+        total_space: 0,
+        available_space: 0,
+        members: vec![Member {
+            name: String::new(),
+            details: String::new(),
+            history: History::default(),
+        }],
+        physical_disks: Vec::new(),
+    }
 }
 
 fn standalone(mount: &str, details: &[&str], total: u64, used: f64) -> Group {
@@ -333,7 +359,10 @@ mod tests {
             .iter()
             .map(|f| (f.from.as_str(), f.to.as_str()))
             .collect();
-        assert_eq!(routes, vec![("D:\\", "M:\\"), ("C:\\", "E:\\")]);
+        assert_eq!(
+            routes,
+            vec![("D:\\", "M:\\"), ("C:\\", "E:\\"), (NETWORK, "D:\\")]
+        );
 
         demo.advance_to(59.5);
         assert!(demo.flows.is_empty());
@@ -356,11 +385,11 @@ mod tests {
     fn stripe_reads_are_split_across_disks() {
         let mut demo = Demo::new();
         demo.advance_to(30.0);
-        let target_write = member_rates(&demo, "D:\\")[0].write;
+        let copy = demo.flows.iter().find(|f| f.from == "S:\\").unwrap().rate;
         let striped: f64 = member_rates(&demo, "S:\\").iter().map(|r| r.read).sum();
-        assert!((striped - target_write).abs() < 5.0 * MIB);
+        assert!((striped - copy).abs() < 5.0 * MIB);
         for disk in member_rates(&demo, "S:\\") {
-            assert!(disk.read < target_write * 0.6);
+            assert!(disk.read < copy * 0.6);
         }
     }
 

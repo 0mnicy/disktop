@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 
-use crate::model::Group;
+use crate::model::{Group, GroupKind};
 
 /// Width of the channel between the columns, in cells. Also the most lanes
 /// it holds before flows have to share.
@@ -26,6 +26,8 @@ pub const ARRAY_HEADER_ROWS: u16 = 2;
 /// Rough heights used to balance the columns.
 const STANDALONE_ROWS: u16 = 7;
 const MEMBER_ROWS: u16 = 6;
+/// The network panel has no capacity bar, so it needs a row less.
+const NETWORK_ROWS: u16 = 6;
 /// How much of each right-angle turn is cut off, in cells.
 const CORNER: f64 = 0.8;
 
@@ -264,10 +266,10 @@ pub fn arrange(area: Rect, groups: &[Group]) -> Board {
 }
 
 fn rows_wanted(group: &Group) -> u16 {
-    if group.is_array() {
-        2 + ARRAY_HEADER_ROWS + MEMBER_ROWS * group.members.len() as u16
-    } else {
-        STANDALONE_ROWS
+    match group.kind {
+        GroupKind::Array(_) => 2 + ARRAY_HEADER_ROWS + MEMBER_ROWS * group.members.len() as u16,
+        GroupKind::Network => NETWORK_ROWS,
+        GroupKind::Standalone => STANDALONE_ROWS,
     }
 }
 
