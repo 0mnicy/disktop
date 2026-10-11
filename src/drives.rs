@@ -1,90 +1,123 @@
-use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::time::Instant;
 
 use sysinfo::{Disk, DiskKind, Disks};
 
-/// How many samples each drive keeps for its graph.
-const HISTORY_LEN: usize = 600;
+use crate::model::{Flow, Group, GroupKind, History, Member, Rate, Source};
 
-/// Throughput over one sample interval, in bytes per second.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Rate {
-    pub read: f64,
-    pub write: f64,
+/// Live readings from the drives on this machine.
+///
+/// For now every volume is a standalone group and no flows are reported.
+/// Array detection and flow tracing come later.
+pub struct DriveMonitor {
+    disks: Disks,
+    groups: Vec<Group>,
+    /// Cumulative (read, written) byte counters from the previous sample.
+    counters: HashMap<String, (u64, u64)>,
+    last_sample: Instant,
 }
 
-#[derive(Debug)]
-pub struct Drive {
-    pub mount: PathBuf,
-    pub label: String,
-    pub file_system: String,
-    pub kind: DiskKind,
-    pub removable: bool,
-    pub total_space: u64,
-    pub available_space: u64,
-    history: VecDeque<Rate>,
-    total_read: u64,
-    total_written: u64,
+impl DriveMonitor {
+    pub fn new() -> Self {
+        let disks = Disks::new_with_refreshed_list();
+        let mut monitor = Self {
+            disks,
+            groups: Vec::new(),
+            counters: HashMap::new(),
+            last_sample: Instant::now(),
+        };
+        monitor.rebuild(None);
+        monitor
+    }
+
+    /// Rebuilds the group list from the current disk list, carrying each
+    /// drive's history over. With `elapsed_secs`, also records a new sample.
+    fn rebuild(&mut self, elapsed_secs: Option<f64>) {
+        let mut previous: HashMap<String, Group> = std::mem::take(&mut self.groups)
+            .into_iter()
+            .map(|g| (g.id.clone(), g))
+            .collect();
+        let mut counters = HashMap::new();
+
+        for disk in self.disks.list() {
+            let id = disk.mount_point().display().to_string();
+            let usage = disk.usage();
+            let now = (usage.total_read_bytes, usage.total_written_bytes);
+
+            let mut history = previous
+                .remove(&id)
+                .and_then(|g| g.members.into_iter().next())
+                .map(|m| m.history)
+                .unwrap_or_default();
+            if let (Some(elapsed), Some(&(read, written))) = (elapsed_secs, self.counters.get(&id))
+            {
+                history.push(Rate {
+                    read: per_second(read, now.0, elapsed),
+                    write: per_second(written, now.1, elapsed),
+                });
+            }
+
+            counters.insert(id.clone(), now);
+            self.groups.push(group_for(disk, id, history));
+        }
+
+        self.counters = counters;
+        self.groups.sort_by(|a, b| a.id.cmp(&b.id));
+    }
 }
 
-impl Drive {
-    fn from_disk(disk: &Disk) -> Self {
-        let usage = disk.usage();
-        Self {
-            mount: disk.mount_point().to_path_buf(),
-            label: disk.name().to_string_lossy().into_owned(),
-            file_system: disk.file_system().to_string_lossy().into_owned(),
-            kind: disk.kind(),
-            removable: disk.is_removable(),
-            total_space: disk.total_space(),
-            available_space: disk.available_space(),
-            history: VecDeque::with_capacity(HISTORY_LEN),
-            total_read: usage.total_read_bytes,
-            total_written: usage.total_written_bytes,
-        }
+impl Source for DriveMonitor {
+    /// Takes a new reading from every drive. Drives that were plugged in
+    /// since the last sample are added, and drives that went away are dropped.
+    fn sample(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_sample).as_secs_f64();
+        self.last_sample = now;
+
+        self.disks.refresh(true);
+        self.rebuild(Some(elapsed));
     }
 
-    fn update(&mut self, disk: &Disk, elapsed_secs: f64) {
-        let usage = disk.usage();
-        if self.history.len() == HISTORY_LEN {
-            self.history.pop_front();
-        }
-        self.history.push_back(Rate {
-            read: per_second(self.total_read, usage.total_read_bytes, elapsed_secs),
-            write: per_second(self.total_written, usage.total_written_bytes, elapsed_secs),
-        });
-        self.total_read = usage.total_read_bytes;
-        self.total_written = usage.total_written_bytes;
-        self.label = disk.name().to_string_lossy().into_owned();
-        self.total_space = disk.total_space();
-        self.available_space = disk.available_space();
+    fn groups(&self) -> &[Group] {
+        &self.groups
     }
 
-    pub fn used_space(&self) -> u64 {
-        self.total_space.saturating_sub(self.available_space)
+    fn flows(&self) -> &[Flow] {
+        &[]
+    }
+}
+
+fn group_for(disk: &Disk, id: String, history: History) -> Group {
+    let label = disk.name().to_string_lossy().into_owned();
+    let mut details = Vec::new();
+    if !label.is_empty() {
+        details.push(label);
+    }
+    let file_system = disk.file_system().to_string_lossy().into_owned();
+    if !file_system.is_empty() {
+        details.push(file_system);
+    }
+    match disk.kind() {
+        DiskKind::SSD => details.push("SSD".to_string()),
+        DiskKind::HDD => details.push("HDD".to_string()),
+        DiskKind::Unknown(_) => {}
+    }
+    if disk.is_removable() {
+        details.push("removable".to_string());
     }
 
-    pub fn used_ratio(&self) -> f64 {
-        if self.total_space == 0 {
-            return 0.0;
-        }
-        self.used_space() as f64 / self.total_space as f64
-    }
-
-    /// The latest sample, or zero before the first one arrives.
-    pub fn current(&self) -> Rate {
-        self.history.back().copied().unwrap_or_default()
-    }
-
-    /// The most recent `count` samples, oldest first.
-    pub fn recent(&self, count: usize) -> impl Iterator<Item = Rate> + '_ {
-        let skip = self.history.len().saturating_sub(count);
-        self.history.iter().skip(skip).copied()
-    }
-
-    pub fn has_samples(&self) -> bool {
-        !self.history.is_empty()
+    Group {
+        title: id.clone(),
+        id,
+        details,
+        kind: GroupKind::Standalone,
+        total_space: disk.total_space(),
+        available_space: disk.available_space(),
+        members: vec![Member {
+            name: String::new(),
+            details: String::new(),
+            history,
+        }],
     }
 }
 
@@ -97,63 +130,6 @@ fn per_second(previous: u64, current: u64, elapsed_secs: f64) -> f64 {
         return 0.0;
     }
     current.saturating_sub(previous) as f64 / elapsed_secs
-}
-
-pub struct DriveMonitor {
-    disks: Disks,
-    drives: Vec<Drive>,
-    last_sample: Instant,
-}
-
-impl DriveMonitor {
-    pub fn new() -> Self {
-        let disks = Disks::new_with_refreshed_list();
-        let mut drives: Vec<Drive> = disks.list().iter().map(Drive::from_disk).collect();
-        drives.sort_by(|a, b| a.mount.cmp(&b.mount));
-        Self {
-            disks,
-            drives,
-            last_sample: Instant::now(),
-        }
-    }
-
-    pub fn drives(&self) -> &[Drive] {
-        &self.drives
-    }
-
-    /// Sum of the latest sample across all drives.
-    pub fn total(&self) -> Rate {
-        self.drives
-            .iter()
-            .map(Drive::current)
-            .fold(Rate::default(), |sum, rate| Rate {
-                read: sum.read + rate.read,
-                write: sum.write + rate.write,
-            })
-    }
-
-    /// Takes a new reading from every drive. Drives that were plugged in since
-    /// the last sample are added, and drives that went away are dropped.
-    pub fn sample(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_sample).as_secs_f64();
-        self.last_sample = now;
-
-        self.disks.refresh(true);
-        let mut previous = std::mem::take(&mut self.drives);
-        for disk in self.disks.list() {
-            let existing = previous.iter().position(|d| d.mount == disk.mount_point());
-            match existing {
-                Some(index) => {
-                    let mut drive = previous.swap_remove(index);
-                    drive.update(disk, elapsed);
-                    self.drives.push(drive);
-                }
-                None => self.drives.push(Drive::from_disk(disk)),
-            }
-        }
-        self.drives.sort_by(|a, b| a.mount.cmp(&b.mount));
-    }
 }
 
 #[cfg(test)]

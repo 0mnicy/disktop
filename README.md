@@ -18,8 +18,10 @@ with a capacity bar and a live graph of reads and writes.
 
 ## Status
 
-Early. Per-drive graphs work today. The goal is to show data moving *between*
-drives, animated, so you can watch a copy from `C:` to `D:` as it happens.
+Early. Per-drive graphs work today. Data moving *between* drives is drawn as
+dots marching along a route from one panel to another, and RAID arrays get
+one panel with their member disks inside it. Both currently run on made-up
+data in `--demo` mode; detecting real arrays and real copies is next.
 
 ## Install
 
@@ -42,9 +44,25 @@ cargo run --release
 ```sh
 disktop                 # sample once a second
 disktop --interval 250  # sample every 250 ms (minimum 100)
+disktop --demo          # made-up arrays and copies, to see the flow view
 ```
 
-Press `q`, `Esc` or `Ctrl+C` to quit.
+| Key | Action |
+| --- | --- |
+| `f` | Show or hide flows |
+| `p` or `Space` | Pause |
+| `q`, `Esc` or `Ctrl+C` | Quit |
+
+### Reading the flow view
+
+Each copy between drives gets its own color, a dim track showing its route,
+and bright dots moving along it from source to destination. Faster copies
+have tighter, quicker dots. Every flow leaves and enters a panel at its own
+point and runs in its own lane in the channel between the columns, so
+streams don't pile on top of each other.
+
+Inside an array, a mirror (RAID 1) copies every dot to each disk, and a
+stripe (RAID 0) sends the dots to its disks in turn.
 
 ## Platforms
 
@@ -54,9 +72,10 @@ Windows 11.
 
 ## Roadmap
 
-- Drive-to-drive flow: link reads on one drive to writes on another by the
+- Detect real arrays: Storage Spaces on Windows, md and LVM on Linux
+- Detect real flows: link reads on one drive to writes on another by the
   process doing them (ETW on Windows, eBPF on Linux)
-- Animated particles along the flow between drive panels
+- Focus mode to highlight one flow and dim the rest
 - Per-process view of who is hitting each drive
 - Keyboard controls for interval, layout and hiding drives
 

@@ -4,40 +4,82 @@ use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::drives::DriveMonitor;
+use crate::flows::FlowField;
+use crate::model::Source;
 use crate::ui;
 
+/// Time between animation frames while flows are moving (about 30 fps).
+const FRAME: Duration = Duration::from_millis(33);
+/// Longest step the dots take in one go, so a stall doesn't teleport them.
+const MAX_STEP_SECS: f64 = 0.1;
+/// How long to wait for a key while paused.
+const PAUSED_WAIT: Duration = Duration::from_secs(60);
+
 pub struct App {
-    pub monitor: DriveMonitor,
+    pub source: Box<dyn Source>,
+    pub field: FlowField,
     pub interval: Duration,
+    pub show_flows: bool,
+    pub paused: bool,
     should_quit: bool,
 }
 
 impl App {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(source: Box<dyn Source>, interval: Duration) -> Self {
+        let mut field = FlowField::new();
+        field.sync(source.flows());
         Self {
-            monitor: DriveMonitor::new(),
+            source,
+            field,
             interval,
+            show_flows: true,
+            paused: false,
             should_quit: false,
         }
     }
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut next_sample = Instant::now() + self.interval;
+        let mut last_step = Instant::now();
         while !self.should_quit {
-            terminal.draw(|frame| ui::draw(frame, self))?;
+            let mut route_lengths = Vec::new();
+            terminal.draw(|frame| route_lengths = ui::draw(frame, self))?;
+            self.field.set_lengths(&route_lengths);
 
-            let timeout = next_sample.saturating_duration_since(Instant::now());
-            if event::poll(timeout)? {
+            // Sleep until the next sample, or the next frame while animating.
+            let now = Instant::now();
+            let mut wake = if self.paused {
+                now + PAUSED_WAIT
+            } else {
+                next_sample
+            };
+            if self.is_animating() {
+                wake = wake.min(now + FRAME);
+            }
+            if event::poll(wake.saturating_duration_since(now))? {
                 self.handle_event(event::read()?);
             }
 
-            if Instant::now() >= next_sample {
-                self.monitor.sample();
-                next_sample = Instant::now() + self.interval;
+            let now = Instant::now();
+            if !self.paused && now >= next_sample {
+                self.source.sample();
+                self.field.sync(self.source.flows());
+                next_sample = now + self.interval;
+            }
+            let dt = now
+                .duration_since(last_step)
+                .as_secs_f64()
+                .min(MAX_STEP_SECS);
+            last_step = now;
+            if self.is_animating() {
+                self.field.step(dt);
             }
         }
         Ok(())
+    }
+
+    fn is_animating(&self) -> bool {
+        self.show_flows && !self.paused && !self.field.is_idle()
     }
 
     fn handle_event(&mut self, event: Event) {
@@ -55,6 +97,8 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            KeyCode::Char('f') => self.show_flows = !self.show_flows,
+            KeyCode::Char('p') | KeyCode::Char(' ') => self.paused = !self.paused,
             _ => {}
         }
     }
