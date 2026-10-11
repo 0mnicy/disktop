@@ -405,6 +405,7 @@ dependencies = [
  "clap",
  "ratatui",
  "sysinfo",
+ "windows",
 ]
 
 [[package]]

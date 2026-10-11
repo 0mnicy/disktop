@@ -1,13 +1,20 @@
 mod app;
+mod attribution;
 mod demo;
 mod drives;
+#[cfg(windows)]
+mod etw;
 mod flows;
 mod format;
 mod layout;
 mod model;
+// Used on Linux; on Windows only its tests run.
+#[cfg_attr(windows, allow(dead_code))]
 mod procio;
 mod sysfs;
 mod ui;
+#[cfg(windows)]
+mod win;
 
 use std::time::Duration;
 

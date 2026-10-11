@@ -22,9 +22,9 @@ Early. Per-drive graphs work today. RAID arrays get one panel with a graph
 for each member disk inside it; on Linux, btrfs filesystems that span
 several disks are detected and grouped this way. Data moving *between*
 drives is drawn as dots marching along a route from one panel to another.
-On Linux these flows are real: disktop sees which process is copying from
-one drive to another. Elsewhere, `--demo` shows the flow view with
-made-up data.
+On Linux and Windows these flows are real: disktop sees which process is
+copying from one drive to another. Elsewhere, `--demo` shows the flow view
+with made-up data.
 
 ### How flows are found on Linux
 
@@ -54,6 +54,21 @@ Without root, only your own processes can be inspected; the footer says so.
 Run `sudo disktop` to see everything. Flows under 512 KiB/s are left out,
 and so is a process reading and writing the same drive, which is usually a
 database or a log rather than a copy.
+
+### How flows are found on Windows
+
+On Windows, disktop starts an Event Tracing for Windows (ETW) session that
+watches the kernel's file and network events. Every read and write names
+the file and the process doing it, so disktop adds up how much each process
+read from and wrote to each drive, and how much it received and sent over
+the network to other machines. That is turned into copies, downloads and
+uploads the same way as on Linux. Files on network shares count as the
+Network panel.
+
+ETW needs Administrator, so run disktop from an Administrator terminal to
+see flows; otherwise the footer says so, and the panels and graphs still
+work. The Network panel counts only hardware adapters that are connected,
+leaving out virtual ones such as Hyper-V and VPNs.
 
 The list of flows under the panels keeps its height once it has appeared,
 so the panels above don't jump as copies start and stop.
@@ -114,12 +129,13 @@ room for a box per disk, member disks are drawn as compact rows.
 Drive stats come from [sysinfo](https://crates.io/crates/sysinfo), which
 supports Windows, Linux and macOS. On Linux, multi-disk btrfs filesystems
 and per-disk I/O are read from `/sys` and `/proc/diskstats`, and flows from
-`/proc`, none of which needs root. Tested on Windows 11 and Ubuntu 24.04.
+`/proc`, none of which needs root. On Windows, flows come from ETW, which
+needs Administrator. Tested on Windows 11 and Ubuntu 24.04.
 
 ## Roadmap
 
 - Detect more arrays: Storage Spaces on Windows; md, LVM and ZFS on Linux
-- Detect real flows on Windows (ETW)
+- Detect real flows on macOS
 - Focus mode to highlight one flow and dim the rest
 - Per-process view of who is hitting each drive
 - Keyboard controls for interval, layout and hiding drives

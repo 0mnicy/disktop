@@ -1,19 +1,13 @@
 //! Real flows on Linux, worked out from `/proc`.
 //!
 //! Every sample, each process's storage I/O counters show how much it read
-//! and wrote. A process that did both is a candidate copy: its open files
-//! say which drives it was reading from and writing to, and the flow between
-//! them is the smaller of the two rates. Files are traced to a drive
-//! through the mount they're on, using the process's own mount table, so
-//! programs inside containers map to the right drive too.
-//!
-//! Downloads show up the same way: a process writing to a drive more than
-//! it read from other drives, while connected to another machine, got the
-//! rest from the network. That becomes a flow from the network panel, but
-//! never bigger than what the process's network actually received, since
-//! programs also write things they made themselves, like databases and logs.
-//! Uploads are the same in reverse: reading a drive more than it wrote to
-//! other drives, capped at what its network sent.
+//! and wrote. For a busy process, its open files say which drives the reads
+//! and writes went to, and its network counters say what it received and
+//! sent; [`attribution`] turns that into copies, downloads and uploads.
+//! Files are traced to a drive through the mount they're on, using the
+//! process's own mount table, so programs inside containers map to the
+//! right drive too. Network traffic only counts while the process holds a
+//! TCP connection to another machine.
 //!
 //! Without root this only sees processes run by the same user. Paths are
 //! rooted at a parameter so tests can use a fake tree; where `/proc` doesn't
@@ -23,12 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Flow, NETWORK};
+use crate::attribution::{self, MIN_FLOW_RATE, ProcessIo};
+use crate::model::Flow;
 use crate::sysfs;
-
-/// Copies slower than this aren't shown, so logs and databases ticking
-/// over don't clutter the screen.
-pub const MIN_FLOW_RATE: f64 = 512.0 * 1024.0;
 
 /// Maps a kernel block device name (`sdb`, `dm-3`) to the panel it belongs to.
 pub type DeviceGroups = HashMap<String, String>;
@@ -150,45 +141,34 @@ impl ProcFlows {
                         .map(|c| c.trim().to_string())
                         .unwrap_or_else(|| pid.to_string());
 
-                    let copy_rate = read_rate.min(write_rate);
-                    let copies = if copy_rate >= MIN_FLOW_RATE {
-                        attribute(&opened.files, copy_rate)
-                    } else {
-                        Vec::new()
-                    };
-                    let copied: f64 = copies.iter().map(|(_, _, rate)| rate).sum();
-                    for (from, to, rate) in copies {
-                        add_flow(&mut flows, from, to, rate, &process);
-                    }
-
-                    // Whatever it wrote that didn't come from another drive
-                    // came from the network, up to what its network received,
-                    // and whatever it read that didn't go to another drive
-                    // went out, up to what its network sent. Either way it
-                    // has to be talking to another machine.
-                    let (received, sent) = match (before.network, now.network) {
+                    // Network traffic only counts while it's talking to
+                    // another machine.
+                    let (mut received, mut sent) = match (before.network, now.network) {
                         (Some((rx0, tx0)), Some((rx1, tx1))) => (
                             rx1.saturating_sub(rx0) as f64 / elapsed,
                             tx1.saturating_sub(tx0) as f64 / elapsed,
                         ),
                         _ => (0.0, 0.0),
                     };
-                    let downloaded = (write_rate - copied).min(received);
-                    let uploaded = (read_rate - copied).min(sent);
-                    if downloaded.max(uploaded) >= MIN_FLOW_RATE && connected(&dir, &opened.sockets)
-                    {
-                        if downloaded >= MIN_FLOW_RATE {
-                            for (to, share) in shares(&opened.files, Side::Writing) {
-                                let rate = downloaded * share;
-                                add_flow(&mut flows, NETWORK.into(), to, rate, &process);
-                            }
-                        }
-                        if uploaded >= MIN_FLOW_RATE {
-                            for (from, share) in shares(&opened.files, Side::Reading) {
-                                let rate = uploaded * share;
-                                add_flow(&mut flows, from, NETWORK.into(), rate, &process);
-                            }
-                        }
+                    if received.max(sent) >= MIN_FLOW_RATE && !connected(&dir, &opened.sockets) {
+                        (received, sent) = (0.0, 0.0);
+                    }
+                    let side = |side, rate: f64| -> Vec<(String, f64)> {
+                        shares(&opened.files, side)
+                            .into_iter()
+                            .map(|(group, share)| (group, share * rate))
+                            .collect()
+                    };
+                    let io = ProcessIo {
+                        reads: side(Side::Reading, read_rate),
+                        writes: side(Side::Writing, write_rate),
+                        received,
+                        sent,
+                    };
+                    // Its counters were busy, but the files they went to
+                    // may not be on any drive shown.
+                    if io.is_busy() {
+                        attribution::add_process_flows(&mut flows, &process, &io);
                     }
                 }
             }
@@ -196,28 +176,7 @@ impl ProcFlows {
         }
 
         self.seen = seen;
-        flows.retain(|f| f.rate >= MIN_FLOW_RATE);
-        flows.sort_by(|a, b| b.rate.total_cmp(&a.rate));
-        flows
-    }
-}
-
-/// Adds a process's share of a flow, merging with other processes copying
-/// between the same two groups.
-fn add_flow(flows: &mut Vec<Flow>, from: String, to: String, rate: f64, process: &str) {
-    match flows.iter_mut().find(|f| f.from == from && f.to == to) {
-        Some(flow) => {
-            flow.rate += rate;
-            if !flow.process.split(", ").any(|p| p == process) {
-                flow.process = format!("{}, {process}", flow.process);
-            }
-        }
-        None => flows.push(Flow {
-            from,
-            to,
-            rate,
-            process: process.to_string(),
-        }),
+        attribution::finish(flows)
     }
 }
 
@@ -337,27 +296,6 @@ fn shares(files: &[OpenFile], side: Side) -> Vec<(String, f64)> {
     shares
 }
 
-/// Splits `rate` across every pair of a group read from and a different
-/// group written to, in proportion to how much each side's files moved.
-/// When offsets don't move (programs using positioned reads and writes),
-/// each open file counts equally.
-fn attribute(files: &[OpenFile], rate: f64) -> Vec<(String, String, f64)> {
-    let reads = shares(files, Side::Reading);
-    let writes = shares(files, Side::Writing);
-
-    let mut flows = Vec::new();
-    for (from, read_share) in &reads {
-        for (to, write_share) in &writes {
-            // Reading and writing the same drive is a database or a log,
-            // not a copy between drives.
-            if from != to {
-                flows.push((from.clone(), to.clone(), rate * read_share * write_share));
-            }
-        }
-    }
-    flows
-}
-
 /// Storage-level (bytes read, bytes written) from `/proc/<pid>/io`. These
 /// count what actually reached or came from disk, not cache hits or sockets.
 fn parse_io(text: &str) -> Option<(u64, u64)> {
@@ -470,6 +408,7 @@ fn read_text(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NETWORK;
 
     const MIB: u64 = 1024 * 1024;
 
@@ -546,36 +485,18 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_between_two_drives_is_one_flow() {
-        let files = [file("/main", false, 0), file("/mnt/MediaArchive3", true, 0)];
-        assert_eq!(
-            attribute(&files, 100.0),
-            vec![("/main".into(), "/mnt/MediaArchive3".into(), 100.0)]
-        );
-    }
-
-    #[test]
-    fn rate_is_split_by_how_far_each_file_moved() {
+    fn shares_follow_how_far_each_file_moved() {
         let files = [
             file("/main", false, 3 * MIB),
             file("/mnt/SSD1", false, MIB),
             file("/", true, 0),
         ];
-        let flows = attribute(&files, 100.0);
         assert_eq!(
-            flows,
-            vec![
-                ("/main".into(), "/".into(), 75.0),
-                ("/mnt/SSD1".into(), "/".into(), 25.0)
-            ]
+            shares(&files, Side::Reading),
+            vec![("/main".into(), 0.75), ("/mnt/SSD1".into(), 0.25)]
         );
-    }
-
-    #[test]
-    fn reading_and_writing_one_drive_is_not_a_flow() {
-        let files = [file("/main", false, 0), file("/main", true, 0)];
-        assert!(attribute(&files, 100.0).is_empty());
-        assert!(attribute(&[file("/main", false, 0)], 100.0).is_empty());
+        // Nothing moved on the writing side, so each file counts equally.
+        assert_eq!(shares(&files, Side::Writing), vec![("/".into(), 1.0)]);
     }
 
     #[test]
@@ -596,18 +517,6 @@ mod tests {
         assert!(is_loopback("00000000000000000000000001000000"));
         assert!(is_loopback("0000000000000000FFFF00000100007F"));
         assert!(!is_loopback("20010DB8000000000000000000000001"));
-    }
-
-    #[test]
-    fn processes_copying_between_the_same_drives_merge() {
-        let mut flows = Vec::new();
-        add_flow(&mut flows, "a".into(), "b".into(), 10.0, "rsync");
-        add_flow(&mut flows, "a".into(), "b".into(), 5.0, "Sonarr");
-        add_flow(&mut flows, "a".into(), "b".into(), 1.0, "rsync");
-        add_flow(&mut flows, "b".into(), "a".into(), 2.0, "cp");
-        assert_eq!(flows.len(), 2);
-        assert_eq!(flows[0].rate, 16.0);
-        assert_eq!(flows[0].process, "rsync, Sonarr");
     }
 
     /// A throwaway directory tree standing in for `/proc`.

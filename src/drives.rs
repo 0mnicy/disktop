@@ -5,13 +5,14 @@ use std::time::Instant;
 use sysinfo::{Disk, DiskKind, Disks};
 
 use crate::model::{Flow, Group, GroupKind, History, Member, NETWORK, Rate, Source};
-use crate::procio::{DeviceGroups, ProcFlows};
+use crate::procio::DeviceGroups;
+#[cfg(not(windows))]
+use crate::procio::ProcFlows;
 use crate::sysfs::{self, Btrfs};
 
 /// Where Linux exposes block devices and filesystems. Missing elsewhere,
 /// which simply means no arrays are found.
 const SYS: &str = "/sys";
-const PROC: &str = "/proc";
 const DISKSTATS: &str = "/proc/diskstats";
 const NET_DEV: &str = "/proc/net/dev";
 
@@ -33,16 +34,18 @@ const HIDDEN_FILE_SYSTEMS: [&str; 6] = [
 ///
 /// Each volume is a standalone group, except a btrfs filesystem spanning
 /// several disks on Linux, which becomes an array with a member per disk.
-/// On Linux, copies between groups are traced from `/proc` as flows.
+/// Copies, downloads and uploads are traced as flows: from `/proc` on Linux
+/// and from ETW on Windows.
 pub struct DriveMonitor {
     disks: Disks,
     groups: Vec<Group>,
     /// Counters from the previous sample: by mount point for volumes, and
     /// by `disk:<name>` for array members.
     counters: Counters,
-    /// Which group each kernel block device belongs to.
+    /// Which group each device belongs to: kernel block devices on Linux,
+    /// volume devices on Windows.
     devices: DeviceGroups,
-    tracer: ProcFlows,
+    tracer: Tracer,
     flows: Vec<Flow>,
     /// Shown in the footer when flows can't all be seen.
     flow_note: Option<String>,
@@ -52,14 +55,7 @@ pub struct DriveMonitor {
 impl DriveMonitor {
     pub fn new() -> Self {
         let disks = Disks::new_with_refreshed_list();
-        let tracer = ProcFlows::new(PROC);
-        let flow_note = if !Path::new(PROC).join("self/fdinfo").exists() {
-            Some("flows are traced on Linux only".to_string())
-        } else if !tracer.sees_everything() {
-            Some("flows: your processes only · run with sudo to see all".to_string())
-        } else {
-            None
-        };
+        let (tracer, flow_note) = Tracer::start();
         let mut monitor = Self {
             disks,
             groups: Vec::new(),
@@ -72,8 +68,7 @@ impl DriveMonitor {
         };
         monitor.rebuild(None);
         // Take a first reading so the next sample has something to compare.
-        let hardware = sysfs::physical_interfaces(Path::new(SYS));
-        monitor.tracer.sample(None, &monitor.devices, &hardware);
+        monitor.tracer.sample(None, &monitor.devices);
         monitor
     }
 
@@ -147,11 +142,7 @@ impl DriveMonitor {
             let disk = &disks[index];
             let id = facts[index].mount.clone();
             let old = previous.remove(&id);
-            let group_devices = match facts[index].array {
-                Some(array) => arrays[array].devices.clone(),
-                None => facts[index].kernel.iter().cloned().collect(),
-            };
-            for device in group_devices {
+            for device in devices_of(&facts[index], &arrays, &id) {
                 devices.insert(device, id.clone());
             }
             let mut group = match facts[index].array {
@@ -180,6 +171,10 @@ impl DriveMonitor {
             self.groups.push(group);
         }
 
+        // Files on network shares count as the network.
+        #[cfg(windows)]
+        devices.insert(crate::etw::NETWORK_VOLUME.to_string(), NETWORK.to_string());
+
         self.groups.sort_by(|a, b| a.id.cmp(&b.id));
         // The network goes first, so it sits at the top of a column.
         if let Some(network) = network_group(previous.remove(NETWORK), &sample, &mut counters) {
@@ -190,18 +185,87 @@ impl DriveMonitor {
     }
 }
 
-/// The machine's network connection: data in and out across its hardware
-/// interfaces. `None` where that can't be read, such as off Linux.
-fn network_group(old: Option<Group>, sample: &Sample, counters: &mut Counters) -> Option<Group> {
+/// The devices that file activity names a group by: kernel block devices
+/// on Linux (every member of an array), volume devices on Windows.
+#[cfg(not(windows))]
+fn devices_of(facts: &MountFacts, arrays: &[Btrfs], _mount: &str) -> Vec<String> {
+    match facts.array {
+        Some(array) => arrays[array].devices.clone(),
+        None => facts.kernel.iter().cloned().collect(),
+    }
+}
+
+#[cfg(windows)]
+fn devices_of(_facts: &MountFacts, _arrays: &[Btrfs], mount: &str) -> Vec<String> {
+    crate::win::volume_device(mount).into_iter().collect()
+}
+
+/// Finds flows: from `/proc` on Linux, from ETW on Windows.
+#[cfg(not(windows))]
+struct Tracer(ProcFlows);
+
+#[cfg(windows)]
+struct Tracer(crate::etw::EtwFlows);
+
+impl Tracer {
+    /// Starts tracing, with a note for the footer when not every flow can
+    /// be seen.
+    #[cfg(not(windows))]
+    fn start() -> (Self, Option<String>) {
+        const PROC: &str = "/proc";
+        let tracer = ProcFlows::new(PROC);
+        let note = if !Path::new(PROC).join("self/fdinfo").exists() {
+            Some("flows are traced on Linux and Windows only".to_string())
+        } else if !tracer.sees_everything() {
+            Some("flows: your processes only · run with sudo to see all".to_string())
+        } else {
+            None
+        };
+        (Self(tracer), note)
+    }
+
+    #[cfg(windows)]
+    fn start() -> (Self, Option<String>) {
+        let tracer = crate::etw::EtwFlows::start();
+        let note = tracer.problem().map(str::to_string);
+        (Self(tracer), note)
+    }
+
+    #[cfg(not(windows))]
+    fn sample(&mut self, elapsed_secs: Option<f64>, devices: &DeviceGroups) -> Vec<Flow> {
+        let hardware = sysfs::physical_interfaces(Path::new(SYS));
+        self.0.sample(elapsed_secs, devices, &hardware)
+    }
+
+    #[cfg(windows)]
+    fn sample(&mut self, elapsed_secs: Option<f64>, devices: &DeviceGroups) -> Vec<Flow> {
+        elapsed_secs.map_or_else(Vec::new, |elapsed| self.0.sample(elapsed, devices))
+    }
+}
+
+/// Names and total bytes (received, sent) of the machine's hardware
+/// network interfaces, or `None` where they can't be read.
+fn network_totals() -> Option<(Vec<String>, (u64, u64))> {
+    #[cfg(windows)]
+    if let Some(found) = crate::win::hardware_network() {
+        return Some(found);
+    }
     let interfaces = sysfs::physical_interfaces(Path::new(SYS));
     if interfaces.is_empty() {
         return None;
     }
     let stats = sysfs::parse_net_dev(&std::fs::read_to_string(NET_DEV).ok()?);
-    let now = interfaces
+    let totals = interfaces
         .iter()
         .filter_map(|name| stats.get(name))
         .fold((0, 0), |(rx, tx), &(r, t)| (rx + r, tx + t));
+    Some((interfaces, totals))
+}
+
+/// The machine's network connection: data in and out across its hardware
+/// interfaces. `None` where that can't be read.
+fn network_group(old: Option<Group>, sample: &Sample, counters: &mut Counters) -> Option<Group> {
+    let (interfaces, now) = network_totals()?;
 
     let mut history = old
         .and_then(|g| g.members.into_iter().next())
@@ -236,8 +300,7 @@ impl Source for DriveMonitor {
 
         self.disks.refresh(true);
         self.rebuild(Some(elapsed));
-        let hardware = sysfs::physical_interfaces(Path::new(SYS));
-        self.flows = self.tracer.sample(Some(elapsed), &self.devices, &hardware);
+        self.flows = self.tracer.sample(Some(elapsed), &self.devices);
     }
 
     fn groups(&self) -> &[Group] {
