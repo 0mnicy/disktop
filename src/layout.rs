@@ -128,15 +128,6 @@ impl Path {
     }
 }
 
-/// How a flow's dots split where it reaches an array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Split {
-    /// Every disk gets every dot (a mirror write).
-    All,
-    /// Dots take turns between disks (striped data, or reads from any copy).
-    Alternate,
-}
-
 /// A flow to route: the groups it runs between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteEnds {
@@ -146,7 +137,8 @@ pub struct RouteEnds {
     pub from_disks: usize,
     /// Member disks to fan into, or 0 for a standalone target.
     pub to_disks: usize,
-    pub target_split: Split,
+    /// How many of the target's disks each dot lands on. See [`branches`].
+    pub target_copies: usize,
 }
 
 /// The full shape of one flow on screen.
@@ -158,7 +150,7 @@ pub struct RoutePaths {
     pub trunk: Path,
     /// From the target port to each target disk; empty for a standalone target.
     pub targets: Vec<Path>,
-    pub target_split: Split,
+    pub target_copies: usize,
 }
 
 impl RoutePaths {
@@ -184,7 +176,7 @@ impl RoutePaths {
         if s < source {
             // Measure back from the port so every branch meets the trunk together.
             let before_port = source - s;
-            branches(&self.sources, Split::Alternate, dot)
+            branches(&self.sources, 1, dot)
                 .filter(|p| before_port <= p.length())
                 .map(|p| p.at(p.length() - before_port))
                 .collect()
@@ -192,7 +184,7 @@ impl RoutePaths {
             vec![self.trunk.at(s - source)]
         } else {
             let after_port = s - source - trunk;
-            branches(&self.targets, self.target_split, dot)
+            branches(&self.targets, self.target_copies, dot)
                 .filter(|p| after_port <= p.length())
                 .map(|p| p.at(after_port))
                 .collect()
@@ -200,17 +192,24 @@ impl RoutePaths {
     }
 }
 
-fn branches(paths: &[Path], split: Split, dot: Option<u64>) -> impl Iterator<Item = &Path> {
-    let only = match (split, dot) {
-        (Split::Alternate, Some(id)) if !paths.is_empty() => {
-            Some((id % paths.len() as u64) as usize)
+/// The branches a dot takes where a route fans out to an array's disks.
+/// Each dot lands on `copies` neighbouring disks, starting one group further
+/// along than the dot before, so a two-copy array of eight disks fills
+/// disks 0–1, then 2–3, and so on. With `copies` at least the disk count,
+/// or with no dot (drawing the track), every branch is returned.
+fn branches(paths: &[Path], copies: usize, dot: Option<u64>) -> impl Iterator<Item = &Path> {
+    let count = paths.len();
+    let copies = copies.max(1);
+    let first = match dot {
+        Some(id) if count > 0 && copies < count => {
+            Some((id % count as u64) as usize * copies % count)
         }
         _ => None,
     };
     paths
         .iter()
         .enumerate()
-        .filter(move |(i, _)| only.is_none_or(|o| o == *i))
+        .filter(move |(i, _)| first.is_none_or(|f| (i + count - f) % count < copies))
         .map(|(_, p)| p)
 }
 
@@ -343,7 +342,7 @@ impl Board {
                     sources,
                     trunk,
                     targets,
-                    target_split: ends.target_split,
+                    target_copies: ends.target_copies,
                 })
             })
             .collect()
@@ -532,7 +531,7 @@ fn reverse(path: &Path) -> Path {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ArrayLevel, GroupKind, History, Member};
+    use crate::model::{ArrayLayout, GroupKind, History, Member};
 
     fn group(kind: GroupKind, members: usize) -> Group {
         Group {
@@ -556,8 +555,8 @@ mod tests {
         vec![
             group(GroupKind::Standalone, 1),
             group(GroupKind::Standalone, 1),
-            group(GroupKind::Array(ArrayLevel::Mirror), 2),
-            group(GroupKind::Array(ArrayLevel::Stripe), 2),
+            group(GroupKind::Array(ArrayLayout::mirror(2)), 2),
+            group(GroupKind::Array(ArrayLayout::stripe()), 2),
             group(GroupKind::Standalone, 1),
         ]
     }
@@ -568,7 +567,7 @@ mod tests {
             to,
             from_disks: 0,
             to_disks: 0,
-            target_split: Split::All,
+            target_copies: 1,
         })
     }
 
@@ -707,7 +706,7 @@ mod tests {
             to: 2,
             from_disks: 2,
             to_disks: 2,
-            target_split: Split::All,
+            target_copies: 2,
         });
         let plan = board.plan(&[route]).remove(0).unwrap();
         assert_eq!(plan.sources.len(), 2);
@@ -731,17 +730,17 @@ mod tests {
     fn points_along_a_route_follow_the_split() {
         let groups = mixed_groups();
         let board = arrange(Rect::new(0, 0, 160, 50), &groups);
-        let ends = |split| RouteEnds {
+        let ends = |copies| RouteEnds {
             from: 0,
             to: 2,
             from_disks: 0,
             to_disks: 2,
-            target_split: split,
+            target_copies: copies,
         };
         // Just past the target port, where every branch is still running.
         let past_port = |plan: &RoutePaths| plan.length() - plan.target_length() + 0.1;
 
-        let mirror = board.plan(&[Some(ends(Split::All))]).remove(0).unwrap();
+        let mirror = board.plan(&[Some(ends(2))]).remove(0).unwrap();
         assert_eq!(
             mirror.points_at(past_port(&mirror), Some(7)).len(),
             2,
@@ -750,10 +749,7 @@ mod tests {
         assert_eq!(mirror.points_at(past_port(&mirror), None).len(), 2);
         assert_eq!(mirror.points_at(1.0, Some(7)).len(), 1, "one trunk");
 
-        let stripe = board
-            .plan(&[Some(ends(Split::Alternate))])
-            .remove(0)
-            .unwrap();
+        let stripe = board.plan(&[Some(ends(1))]).remove(0).unwrap();
         // Near the end of the shorter branch, where the two have parted.
         let shorter = stripe
             .targets
@@ -766,6 +762,31 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_ne!(first, second, "stripe dots take turns");
+    }
+
+    #[test]
+    fn dots_land_on_copies_neighbouring_disks_in_turn() {
+        let paths: Vec<Path> = (0..8)
+            .map(|i| Path::new(vec![(0.0, f64::from(i)), (1.0, f64::from(i))]))
+            .collect();
+        let landed = |copies, dot| -> Vec<f64> {
+            branches(&paths, copies, Some(dot))
+                .map(|p| p.at(0.0).1)
+                .collect()
+        };
+        // Two copies over eight disks: 0–1, then 2–3, …, then back to 0–1.
+        assert_eq!(landed(2, 0), vec![0.0, 1.0]);
+        assert_eq!(landed(2, 1), vec![2.0, 3.0]);
+        assert_eq!(landed(2, 3), vec![6.0, 7.0]);
+        assert_eq!(landed(2, 4), vec![0.0, 1.0]);
+        // One copy takes turns; as many copies as disks lands on all of them.
+        assert_eq!(landed(1, 5), vec![5.0]);
+        assert_eq!(landed(8, 5).len(), 8);
+        assert_eq!(
+            branches(&paths, 2, None).count(),
+            8,
+            "tracks show every branch"
+        );
     }
 
     #[test]

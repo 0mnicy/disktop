@@ -5,6 +5,7 @@ mod flows;
 mod format;
 mod layout;
 mod model;
+mod sysfs;
 mod ui;
 
 use std::time::Duration;

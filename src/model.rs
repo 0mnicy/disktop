@@ -72,29 +72,43 @@ pub struct Member {
     pub history: History,
 }
 
-/// How an array spreads data over its members. This decides how flow
-/// particles split when they reach the array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArrayLevel {
-    /// Every member holds a full copy (RAID 1).
-    Mirror,
-    /// Data is split across members (RAID 0).
-    Stripe,
+/// How an array spreads data over its members. `copies` decides how flow
+/// dots split when they reach the array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayLayout {
+    /// Shown in the panel title, such as `RAID 10`.
+    pub level: String,
+    /// A few words on how data is stored, such as `2 copies, striped`.
+    pub summary: String,
+    /// How many disks each write lands on: every disk for a classic
+    /// mirror, two for btrfs RAID 1 or 10, one for a stripe.
+    pub copies: usize,
 }
 
-impl ArrayLevel {
-    pub fn label(self) -> &'static str {
-        match self {
-            ArrayLevel::Mirror => "RAID 1",
-            ArrayLevel::Stripe => "RAID 0",
+impl ArrayLayout {
+    /// Classic RAID 1: every disk holds a full copy.
+    pub fn mirror(disks: usize) -> Self {
+        Self {
+            level: "RAID 1".into(),
+            summary: "mirror".into(),
+            copies: disks,
+        }
+    }
+
+    /// RAID 0: data is split across the disks with no copies.
+    pub fn stripe() -> Self {
+        Self {
+            level: "RAID 0".into(),
+            summary: "stripe".into(),
+            copies: 1,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupKind {
     Standalone,
-    Array(ArrayLevel),
+    Array(ArrayLayout),
 }
 
 /// One panel on screen.
@@ -199,7 +213,7 @@ mod tests {
             id: "m".into(),
             title: "M:\\".into(),
             details: vec![],
-            kind: GroupKind::Array(ArrayLevel::Mirror),
+            kind: GroupKind::Array(ArrayLayout::mirror(2)),
             total_space: 100,
             available_space: 25,
             members: vec![member(1.0, 10.0), member(2.0, 10.0)],

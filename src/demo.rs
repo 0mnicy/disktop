@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use crate::model::{ArrayLevel, Flow, Group, GroupKind, History, Member, Rate, Source};
+use crate::model::{ArrayLayout, Flow, Group, GroupKind, History, Member, Rate, Source};
 
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * MIB;
@@ -114,7 +114,7 @@ impl Demo {
         for flow in &flows {
             if let Some(i) = self.groups.iter().position(|g| g.id == flow.from) {
                 spread(
-                    self.groups[i].kind,
+                    &self.groups[i].kind,
                     &mut rates[i],
                     flow.rate,
                     Direction::Read,
@@ -122,7 +122,7 @@ impl Demo {
             }
             if let Some(i) = self.groups.iter().position(|g| g.id == flow.to) {
                 spread(
-                    self.groups[i].kind,
+                    &self.groups[i].kind,
                     &mut rates[i],
                     flow.rate,
                     Direction::Write,
@@ -203,13 +203,17 @@ fn ramp(t: f64, start: f64, end: f64) -> f64 {
 }
 
 /// Adds a group-level transfer to its member disks the way the array lays
-/// data out: a mirror writes everything to every disk, a stripe splits it.
-fn spread(kind: GroupKind, members: &mut [Rate], rate: f64, direction: Direction) {
-    let count = members.len().max(1) as f64;
+/// data out: reads are shared across the disks, and each write lands on
+/// `copies` of them, so a mirror writes everything to every disk and a
+/// stripe splits it.
+fn spread(kind: &GroupKind, members: &mut [Rate], rate: f64, direction: Direction) {
+    let count = members.len().max(1);
     let per_member = match (kind, direction) {
         (GroupKind::Standalone, _) => rate,
-        (GroupKind::Array(ArrayLevel::Mirror), Direction::Write) => rate,
-        (GroupKind::Array(_), _) => rate / count,
+        (GroupKind::Array(layout), Direction::Write) => {
+            rate * layout.copies.min(count) as f64 / count as f64
+        }
+        (GroupKind::Array(_), Direction::Read) => rate / count as f64,
     };
     for member in members {
         match direction {
@@ -227,7 +231,7 @@ fn demo_groups() -> Vec<Group> {
             "M:\\",
             "Media",
             "ReFS",
-            ArrayLevel::Mirror,
+            ArrayLayout::mirror(2),
             8 * TB,
             0.54,
             &[
@@ -239,7 +243,7 @@ fn demo_groups() -> Vec<Group> {
             "S:\\",
             "Scratch",
             "NTFS",
-            ArrayLevel::Stripe,
+            ArrayLayout::stripe(),
             4 * TB,
             0.23,
             &[
@@ -271,7 +275,7 @@ fn array(
     mount: &str,
     label: &str,
     file_system: &str,
-    level: ArrayLevel,
+    layout: ArrayLayout,
     total: u64,
     used: f64,
     disks: &[(&str, &str)],
@@ -279,8 +283,8 @@ fn array(
     Group {
         id: mount.to_string(),
         title: format!("{mount}  {label}"),
-        details: vec![level.label().to_string(), file_system.to_string()],
-        kind: GroupKind::Array(level),
+        details: vec![layout.level.clone(), file_system.to_string()],
+        kind: GroupKind::Array(layout),
         total_space: total,
         available_space: (total as f64 * (1.0 - used)) as u64,
         members: disks

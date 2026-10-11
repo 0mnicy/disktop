@@ -9,8 +9,8 @@ use ratatui::widgets::{Axis, Block, BorderType, Chart, Dataset, GraphType, LineG
 use crate::app::App;
 use crate::flows::{FlowField, Route};
 use crate::format;
-use crate::layout::{self, Board, Panel, Point, RouteEnds, Split};
-use crate::model::{ArrayLevel, Group, GroupKind, History, Member, Rate};
+use crate::layout::{self, Board, Panel, Point, RouteEnds};
+use crate::model::{ArrayLayout, Group, GroupKind, History, Member, Rate};
 
 const READ_COLOR: Color = Color::Cyan;
 const WRITE_COLOR: Color = Color::Magenta;
@@ -32,6 +32,9 @@ const TRACK_COLORS: [Color; 5] = [
 ];
 /// Most flows listed under the panels.
 const MAX_LISTED_FLOWS: usize = 4;
+/// Member disks get a box only when every box can be this tall: border,
+/// rates and a two-row graph. Otherwise they're drawn as compact rows.
+const MIN_BOXED_MEMBER_ROWS: u16 = 5;
 /// The flow list's route column is at least this wide, so it rarely changes.
 const MIN_ROUTE_WIDTH: usize = 28;
 /// Distance between the dots that draw a track, in cells.
@@ -73,9 +76,9 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
     let board = layout::arrange(body, groups);
     for panel in &board.panels {
         let group = &groups[panel.group];
-        match group.kind {
+        match &group.kind {
             GroupKind::Standalone => draw_standalone(frame, panel.area, group),
-            GroupKind::Array(level) => draw_array(frame, panel, group, level),
+            GroupKind::Array(array) => draw_array(frame, panel, group, array),
         }
     }
 
@@ -170,7 +173,7 @@ fn draw_standalone(frame: &mut Frame, area: Rect, group: &Group) {
     draw_graph(frame, graph, &member.history, &samples);
 }
 
-fn draw_array(frame: &mut Frame, panel: &Panel, group: &Group, level: ArrayLevel) {
+fn draw_array(frame: &mut Frame, panel: &Panel, group: &Group, array: &ArrayLayout) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(ARRAY_COLOR))
@@ -182,21 +185,32 @@ fn draw_array(frame: &mut Frame, panel: &Panel, group: &Group, level: ArrayLevel
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(parts.header);
     frame.render_widget(capacity_gauge(group), capacity);
 
-    let layout_word = match level {
-        ArrayLevel::Mirror => "mirror",
-        ArrayLevel::Stripe => "stripe",
-    };
     let total = group.current();
     let status_line = Line::from(vec![
-        format!("{layout_word} · {}   ", plural(group.members.len(), "disk")).dark_gray(),
+        format!(
+            "{} · {}   ",
+            array.summary,
+            plural(group.members.len(), "disk")
+        )
+        .dark_gray(),
         rate_span("read", total.read, READ_COLOR),
         "   ".into(),
         rate_span("write", total.write, WRITE_COLOR),
     ]);
     frame.render_widget(status_line, status);
 
+    // Boxed disks when every box has room for a graph, otherwise one
+    // compact row per disk, so a big array still fits.
+    let boxed = parts
+        .members
+        .iter()
+        .all(|area| area.height >= MIN_BOXED_MEMBER_ROWS);
     for (member, area) in group.members.iter().zip(&parts.members) {
-        draw_member(frame, *area, member);
+        if boxed {
+            draw_member(frame, *area, member);
+        } else {
+            draw_member_row(frame, *area, member);
+        }
     }
 }
 
@@ -219,6 +233,25 @@ fn draw_member(frame: &mut Frame, area: Rect, member: &Member) {
     let samples = recent_samples(&member.history, graph);
     frame.render_widget(rates_line(member.history.current(), peak(&samples)), rates);
     draw_graph(frame, graph, &member.history, &samples);
+}
+
+/// A member disk without a box: name, rates and model on one line, and a
+/// graph underneath when there's room.
+fn draw_member_row(frame: &mut Frame, area: Rect, member: &Member) {
+    let [text, graph] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let current = member.history.current();
+    let line = Line::from(vec![
+        format!("{:<5} ", member.name).bold(),
+        rate_span("read", current.read, READ_COLOR),
+        "  ".into(),
+        rate_span("write", current.write, WRITE_COLOR),
+        format!("  {}", member.details).dark_gray(),
+    ]);
+    frame.render_widget(line, text);
+    if graph.height > 0 {
+        let samples = recent_samples(&member.history, graph);
+        draw_graph(frame, graph, &member.history, &samples);
+    }
 }
 
 fn group_title(group: &Group) -> Line<'static> {
@@ -345,16 +378,16 @@ fn plan_routes(
         .map(|route| {
             let from = index_of(&route.from)?;
             let to = index_of(&route.to)?;
-            let target_split = match groups[to].kind {
-                GroupKind::Array(ArrayLevel::Mirror) => Split::All,
-                _ => Split::Alternate,
+            let target_copies = match &groups[to].kind {
+                GroupKind::Array(array) => array.copies,
+                GroupKind::Standalone => 1,
             };
             Some(RouteEnds {
                 from,
                 to,
                 from_disks: disks(&groups[from]),
                 to_disks: disks(&groups[to]),
-                target_split,
+                target_copies,
             })
         })
         .collect();

@@ -1,9 +1,19 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Instant;
 
 use sysinfo::{Disk, DiskKind, Disks};
 
 use crate::model::{Flow, Group, GroupKind, History, Member, Rate, Source};
+use crate::sysfs::{self, Btrfs};
+
+/// Where Linux exposes block devices and filesystems. Missing elsewhere,
+/// which simply means no arrays are found.
+const SYS: &str = "/sys";
+const DISKSTATS: &str = "/proc/diskstats";
+
+/// Cumulative (bytes read, bytes written) counters, keyed by what they count.
+type Counters = HashMap<String, (u64, u64)>;
 
 /// File systems that aren't drives: container image layers and similar
 /// virtual mounts that sysinfo still reports.
@@ -18,13 +28,15 @@ const HIDDEN_FILE_SYSTEMS: [&str; 6] = [
 
 /// Live readings from the drives on this machine.
 ///
-/// For now every volume is a standalone group and no flows are reported.
-/// Array detection and flow tracing come later.
+/// Each volume is a standalone group, except a btrfs filesystem spanning
+/// several disks on Linux, which becomes an array with a member per disk.
+/// No flows are reported yet.
 pub struct DriveMonitor {
     disks: Disks,
     groups: Vec<Group>,
-    /// Cumulative (read, written) byte counters from the previous sample.
-    counters: HashMap<String, (u64, u64)>,
+    /// Counters from the previous sample: by mount point for volumes, and
+    /// by `disk:<name>` for array members.
+    counters: Counters,
     last_sample: Instant,
 }
 
@@ -48,49 +60,77 @@ impl DriveMonitor {
             .into_iter()
             .map(|g| (g.id.clone(), g))
             .collect();
-        let mut counters = HashMap::new();
+        let mut counters = Counters::new();
+        let sample = Sample {
+            elapsed_secs,
+            previous: &self.counters,
+        };
+
+        // Btrfs filesystems that span several disks, and which one each disk
+        // belongs to.
+        let arrays: Vec<Btrfs> = sysfs::btrfs_filesystems(Path::new(SYS))
+            .into_iter()
+            .filter(|fs| fs.devices.len() > 1)
+            .collect();
+        let array_of: HashMap<&str, usize> = arrays
+            .iter()
+            .enumerate()
+            .flat_map(|(i, fs)| fs.devices.iter().map(move |d| (d.as_str(), i)))
+            .collect();
+        let diskstats = if arrays.is_empty() {
+            Counters::new()
+        } else {
+            std::fs::read_to_string(DISKSTATS)
+                .map(|text| sysfs::parse_diskstats(&text))
+                .unwrap_or_default()
+        };
 
         let disks = self.disks.list();
-        let facts: Vec<[String; 3]> = disks
+        let facts: Vec<MountFacts> = disks
             .iter()
             .map(|d| {
-                [
-                    d.mount_point().display().to_string(),
-                    d.name().to_string_lossy().into_owned(),
-                    d.file_system().to_string_lossy().into_owned(),
-                ]
+                let device = d.name().to_string_lossy().into_owned();
+                let array =
+                    kernel_name(&device).and_then(|name| array_of.get(name.as_str()).copied());
+                // Mounts of one btrfs filesystem may name different member
+                // devices, so they're merged by filesystem instead.
+                let key = match array {
+                    Some(i) => Some(format!("btrfs:{}", arrays[i].uuid)),
+                    None => device.starts_with("/dev/").then_some(device),
+                };
+                MountFacts {
+                    mount: d.mount_point().display().to_string(),
+                    key,
+                    file_system: d.file_system().to_string_lossy().into_owned(),
+                    array,
+                }
             })
             .collect();
         let mounts: Vec<MountInfo> = facts
             .iter()
-            .map(|[mount, device, file_system]| MountInfo {
-                mount,
-                device,
-                file_system,
+            .map(|f| MountInfo {
+                mount: &f.mount,
+                key: f.key.as_deref(),
+                file_system: &f.file_system,
             })
             .collect();
 
         for (index, other_mounts) in pick_mounts(&mounts) {
             let disk = &disks[index];
-            let id = facts[index][0].clone();
-            let usage = disk.usage();
-            let now = (usage.total_read_bytes, usage.total_written_bytes);
-
-            let mut history = previous
-                .remove(&id)
-                .and_then(|g| g.members.into_iter().next())
-                .map(|m| m.history)
-                .unwrap_or_default();
-            if let (Some(elapsed), Some(&(read, written))) = (elapsed_secs, self.counters.get(&id))
-            {
-                history.push(Rate {
-                    read: per_second(read, now.0, elapsed),
-                    write: per_second(written, now.1, elapsed),
-                });
-            }
-
-            counters.insert(id.clone(), now);
-            let mut group = group_for(disk, id, history);
+            let id = facts[index].mount.clone();
+            let old = previous.remove(&id);
+            let mut group = match facts[index].array {
+                Some(array) => array_group(
+                    disk,
+                    id,
+                    &arrays[array],
+                    old,
+                    &diskstats,
+                    &sample,
+                    &mut counters,
+                ),
+                None => volume_group(disk, id, old, &sample, &mut counters),
+            };
             if other_mounts > 0 {
                 let plural = if other_mounts == 1 { "" } else { "s" };
                 group.details.push(format!("+{other_mounts} mount{plural}"));
@@ -124,12 +164,35 @@ impl Source for DriveMonitor {
     }
 }
 
+/// What's known about a mount before deciding whether it gets a panel.
+struct MountFacts {
+    mount: String,
+    key: Option<String>,
+    file_system: String,
+    /// Index of the multi-disk btrfs filesystem it belongs to.
+    array: Option<usize>,
+}
+
 /// The facts used to pick which mounts get a panel.
 struct MountInfo<'a> {
     mount: &'a str,
-    /// A device path such as `/dev/sdb` on Linux, or a volume label on Windows.
-    device: &'a str,
+    /// Mounts with the same key are the same storage and get one panel: the
+    /// device path on Linux, or the btrfs filesystem. `None` (Windows volume
+    /// labels, which can repeat) never merges.
+    key: Option<&'a str>,
     file_system: &'a str,
+}
+
+/// The kernel's name for a `/dev` device, such as `sdb` for `/dev/sdb` or
+/// `dm-2` for `/dev/mapper/mpathg-part1`.
+fn kernel_name(device: &str) -> Option<String> {
+    if !device.starts_with("/dev/") {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(device).unwrap_or_else(|_| device.into());
+    resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Picks the mounts to show, as indices into `mounts`, each with how many
@@ -143,21 +206,120 @@ fn pick_mounts(mounts: &[MountInfo]) -> Vec<(usize, usize)> {
     order.sort_by_key(|&i| (mounts[i].mount.len(), mounts[i].mount));
 
     let mut picked: Vec<(usize, usize)> = Vec::new();
-    let mut by_device: HashMap<&str, usize> = HashMap::new();
+    let mut by_key: HashMap<&str, usize> = HashMap::new();
     for i in order {
-        let device = mounts[i].device;
-        // Only real device paths are merged. Windows reports volume labels
-        // here, and two volumes can share a label.
-        if device.starts_with("/dev/") {
-            if let Some(&slot) = by_device.get(device) {
+        if let Some(key) = mounts[i].key {
+            if let Some(&slot) = by_key.get(key) {
                 picked[slot].1 += 1;
                 continue;
             }
-            by_device.insert(device, picked.len());
+            by_key.insert(key, picked.len());
         }
         picked.push((i, 0));
     }
     picked
+}
+
+/// The time since the last sample and the counters it recorded, used to
+/// turn cumulative counters into rates.
+struct Sample<'a> {
+    elapsed_secs: Option<f64>,
+    previous: &'a Counters,
+}
+
+impl Sample<'_> {
+    /// Records `now` under `key` and returns the rate since the last sample.
+    fn rate(&self, key: &str, now: (u64, u64), next: &mut Counters) -> Option<Rate> {
+        next.insert(key.to_string(), now);
+        let elapsed = self.elapsed_secs?;
+        let &(read, written) = self.previous.get(key)?;
+        Some(Rate {
+            read: per_second(read, now.0, elapsed),
+            write: per_second(written, now.1, elapsed),
+        })
+    }
+}
+
+/// A standalone volume, with I/O from sysinfo.
+fn volume_group(
+    disk: &Disk,
+    id: String,
+    old: Option<Group>,
+    sample: &Sample,
+    counters: &mut Counters,
+) -> Group {
+    let usage = disk.usage();
+    let mut history = old
+        .and_then(|g| g.members.into_iter().next())
+        .map(|m| m.history)
+        .unwrap_or_default();
+    let now = (usage.total_read_bytes, usage.total_written_bytes);
+    if let Some(rate) = sample.rate(&id, now, counters) {
+        history.push(rate);
+    }
+    group_for(disk, id, history)
+}
+
+/// A btrfs filesystem spanning several disks, with a member and its own
+/// I/O for each disk.
+fn array_group(
+    disk: &Disk,
+    id: String,
+    fs: &Btrfs,
+    old: Option<Group>,
+    diskstats: &Counters,
+    sample: &Sample,
+    counters: &mut Counters,
+) -> Group {
+    let sys = Path::new(SYS);
+    let mut histories: HashMap<String, History> = old
+        .map(|g| g.members.into_iter().map(|m| (m.name, m.history)).collect())
+        .unwrap_or_default();
+    let members = fs
+        .devices
+        .iter()
+        .map(|device| {
+            let mut history = histories.remove(device).unwrap_or_default();
+            if let Some(&now) = diskstats.get(device)
+                && let Some(rate) = sample.rate(&format!("disk:{device}"), now, counters)
+            {
+                history.push(rate);
+            }
+            Member {
+                name: device.clone(),
+                details: sysfs::device_details(sys, device),
+                history,
+            }
+        })
+        .collect();
+
+    let layout = sysfs::btrfs_layout(fs.profile.as_deref());
+    let mut details = Vec::new();
+    if !fs.label.is_empty() {
+        details.push(fs.label.clone());
+    }
+    details.push(layout.level.clone());
+    details.push("btrfs".to_string());
+    let spinning: Vec<Option<bool>> = fs
+        .devices
+        .iter()
+        .map(|d| sysfs::is_rotational(sys, d))
+        .collect();
+    if spinning.iter().all(|s| *s == Some(true)) {
+        details.push("HDD".to_string());
+    } else if spinning.iter().all(|s| *s == Some(false)) {
+        details.push("SSD".to_string());
+    }
+
+    Group {
+        title: id.clone(),
+        id,
+        details,
+        kind: GroupKind::Array(layout),
+        total_space: disk.total_space(),
+        available_space: disk.available_space(),
+        members,
+    }
 }
 
 fn group_for(disk: &Disk, id: String, history: History) -> Group {
@@ -224,10 +386,12 @@ mod tests {
         assert_eq!(per_second(0, 1_000, 0.0), 0.0);
     }
 
+    /// A mount keyed the way the monitor keys it: by `/dev` path, and not at
+    /// all for a Windows volume label.
     fn mount<'a>(mount: &'a str, device: &'a str, file_system: &'a str) -> MountInfo<'a> {
         MountInfo {
             mount,
-            device,
+            key: device.starts_with("/dev/").then_some(device),
             file_system,
         }
     }
@@ -270,6 +434,55 @@ mod tests {
             picked_mounts(&mounts),
             vec![("/main", 1), ("/mnt/Media01", 0)]
         );
+    }
+
+    #[test]
+    fn mounts_of_one_btrfs_filesystem_merge_even_through_different_disks() {
+        let mounts = [
+            MountInfo {
+                mount: "/main",
+                key: Some("btrfs:a609a9a7"),
+                file_system: "btrfs",
+            },
+            MountInfo {
+                mount: "/export/MainMediaShare",
+                key: Some("btrfs:a609a9a7"),
+                file_system: "btrfs",
+            },
+            mount("/mnt/SSD1", "/dev/nvme0n1p1", "ext4"),
+        ];
+        assert_eq!(picked_mounts(&mounts), vec![("/main", 1), ("/mnt/SSD1", 0)]);
+    }
+
+    #[test]
+    fn sample_turns_counters_into_rates() {
+        let mut previous = Counters::new();
+        previous.insert("disk:sda".into(), (1_000, 5_000));
+        let sample = Sample {
+            elapsed_secs: Some(2.0),
+            previous: &previous,
+        };
+        let mut next = Counters::new();
+        let rate = sample.rate("disk:sda", (3_000, 9_000), &mut next);
+        assert_eq!(
+            rate,
+            Some(Rate {
+                read: 1_000.0,
+                write: 2_000.0
+            })
+        );
+        assert_eq!(
+            sample.rate("disk:sdb", (1, 1), &mut next),
+            None,
+            "first sight"
+        );
+        assert_eq!(next.len(), 2, "both counters kept for next time");
+    }
+
+    #[test]
+    fn non_dev_names_have_no_kernel_name() {
+        assert_eq!(kernel_name("Main Drive"), None);
+        assert_eq!(kernel_name("overlay"), None);
     }
 
     #[test]
