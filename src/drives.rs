@@ -90,8 +90,10 @@ impl DriveMonitor {
             .iter()
             .map(|d| {
                 let device = d.name().to_string_lossy().into_owned();
-                let array =
-                    kernel_name(&device).and_then(|name| array_of.get(name.as_str()).copied());
+                let kernel = kernel_name(&device);
+                let array = kernel
+                    .as_deref()
+                    .and_then(|name| array_of.get(name).copied());
                 // Mounts of one btrfs filesystem may name different member
                 // devices, so they're merged by filesystem instead.
                 let key = match array {
@@ -102,6 +104,7 @@ impl DriveMonitor {
                     mount: d.mount_point().display().to_string(),
                     key,
                     file_system: d.file_system().to_string_lossy().into_owned(),
+                    kernel,
                     array,
                 }
             })
@@ -129,7 +132,14 @@ impl DriveMonitor {
                     &sample,
                     &mut counters,
                 ),
-                None => volume_group(disk, id, old, &sample, &mut counters),
+                None => volume_group(
+                    disk,
+                    id,
+                    facts[index].kernel.as_deref(),
+                    old,
+                    &sample,
+                    &mut counters,
+                ),
             };
             if other_mounts > 0 {
                 let plural = if other_mounts == 1 { "" } else { "s" };
@@ -169,6 +179,8 @@ struct MountFacts {
     mount: String,
     key: Option<String>,
     file_system: String,
+    /// The kernel's name for its device, on Linux.
+    kernel: Option<String>,
     /// Index of the multi-disk btrfs filesystem it belongs to.
     array: Option<usize>,
 }
@@ -244,6 +256,7 @@ impl Sample<'_> {
 fn volume_group(
     disk: &Disk,
     id: String,
+    kernel: Option<&str>,
     old: Option<Group>,
     sample: &Sample,
     counters: &mut Counters,
@@ -257,7 +270,10 @@ fn volume_group(
     if let Some(rate) = sample.rate(&id, now, counters) {
         history.push(rate);
     }
-    group_for(disk, id, history)
+    let physical_disks = kernel
+        .map(|name| sysfs::physical_disks(Path::new(SYS), name))
+        .unwrap_or_default();
+    group_for(disk, id, history, physical_disks)
 }
 
 /// A btrfs filesystem spanning several disks, with a member and its own
@@ -310,6 +326,11 @@ fn array_group(
     } else if spinning.iter().all(|s| *s == Some(false)) {
         details.push("SSD".to_string());
     }
+    let physical_disks = fs
+        .devices
+        .iter()
+        .flat_map(|d| sysfs::physical_disks(sys, d))
+        .collect();
 
     Group {
         title: id.clone(),
@@ -319,10 +340,11 @@ fn array_group(
         total_space: disk.total_space(),
         available_space: disk.available_space(),
         members,
+        physical_disks,
     }
 }
 
-fn group_for(disk: &Disk, id: String, history: History) -> Group {
+fn group_for(disk: &Disk, id: String, history: History, physical_disks: Vec<String>) -> Group {
     let label = disk.name().to_string_lossy().into_owned();
     let mut details = Vec::new();
     if !label.is_empty() {
@@ -353,6 +375,7 @@ fn group_for(disk: &Disk, id: String, history: History) -> Group {
             details: String::new(),
             history,
         }],
+        physical_disks,
     }
 }
 

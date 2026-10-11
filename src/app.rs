@@ -25,8 +25,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(source: Box<dyn Source>, interval: Duration) -> Self {
-        let mut field = FlowField::new();
+    pub fn new(source: Box<dyn Source>, interval: Duration, dot_size: Option<f64>) -> Self {
+        let mut field = FlowField::new(dot_size);
         field.sync(source.flows());
         Self {
             source,

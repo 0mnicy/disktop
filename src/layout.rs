@@ -548,6 +548,7 @@ mod tests {
                     history: History::default(),
                 })
                 .collect(),
+            physical_disks: Vec::new(),
         }
     }
 

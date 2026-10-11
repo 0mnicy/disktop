@@ -34,6 +34,11 @@ struct Args {
     /// Show made-up arrays and copies instead of your real drives.
     #[arg(long)]
     demo: bool,
+
+    /// How much data each flow dot stands for, such as 1M or 512K (binary
+    /// units). By default it adjusts to the busiest flow.
+    #[arg(long, value_name = "SIZE", value_parser = format::parse_size)]
+    dot_size: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -43,6 +48,6 @@ fn main() -> Result<()> {
     } else {
         Box::new(DriveMonitor::new())
     };
-    let mut app = App::new(source, Duration::from_millis(args.interval));
+    let mut app = App::new(source, Duration::from_millis(args.interval), args.dot_size);
     ratatui::run(|terminal| app.run(terminal))
 }

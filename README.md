@@ -46,6 +46,7 @@ cargo run --release
 disktop                 # sample once a second
 disktop --interval 250  # sample every 250 ms (minimum 100)
 disktop --demo          # made-up arrays and copies, to see the flow view
+disktop --dot-size 1M   # make every flow dot stand for 1 MiB
 ```
 
 | Key | Action |
@@ -57,10 +58,16 @@ disktop --demo          # made-up arrays and copies, to see the flow view
 ### Reading the flow view
 
 Each copy between drives gets its own color, a dim track showing its route,
-and bright dots moving along it from source to destination. Faster copies
-have tighter, quicker dots. Every flow leaves and enters a panel at its own
-point and runs in its own lane in the channel between the columns, so
-streams don't pile on top of each other.
+and bright dots moving along it from source to destination. Every flow
+leaves and enters a panel at its own point and runs in its own lane in the
+channel between the columns, so streams don't pile on top of each other.
+
+Every dot stands for the same amount of data across all flows, like the
+scale on a map, and the list under the panels says how much (`each dot is
+50 MiB`). Dots all move at the same speed, so a flow with twice as many
+dots is moving twice as much data. The amount is a round size picked so the
+busiest flow shows a readable number of dots; it only changes when the
+busiest flow speeds up or slows down a lot. Use `--dot-size` to fix it.
 
 Inside an array, each dot lands on as many disks as the array keeps copies:
 every disk for a classic mirror, two neighbouring disks at a time for btrfs

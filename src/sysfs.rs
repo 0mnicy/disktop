@@ -138,6 +138,39 @@ pub fn is_rotational(sys: &Path, device: &str) -> Option<bool> {
     read_trimmed(&class.join(disk).join("queue/rotational")).map(|v| v == "1")
 }
 
+/// The physical disks a block device sits on: the disk itself, the disk
+/// under a partition, or the disks under a device-mapper device such as an
+/// LVM or encrypted volume. A multipath device is one disk however many
+/// paths it has, so it's named by its multipath name (`mpathg`).
+pub fn physical_disks(sys: &Path, device: &str) -> Vec<String> {
+    let class = sys.join("class/block");
+    let mut disks = Vec::new();
+    collect_disks(&class, device, &mut disks, 0);
+    disks.sort();
+    disks.dedup();
+    disks
+}
+
+fn collect_disks(class: &Path, device: &str, disks: &mut Vec<String>, depth: usize) {
+    // Device-mapper stacks are shallow; this only guards against a loop.
+    if depth > 8 {
+        return;
+    }
+    let dir = class.join(device);
+    if read_trimmed(&dir.join("dm/uuid")).is_some_and(|uuid| uuid.starts_with("mpath-")) {
+        disks.push(read_trimmed(&dir.join("dm/name")).unwrap_or_else(|| device.to_string()));
+        return;
+    }
+    match names_in(&dir.join("slaves")) {
+        Some(slaves) if !slaves.is_empty() => {
+            for slave in slaves {
+                collect_disks(class, &slave, disks, depth + 1);
+            }
+        }
+        _ => disks.push(parent_disk(class, device)),
+    }
+}
+
 /// The whole disk a device belongs to: itself for a disk, or the disk a
 /// partition sits on (`sda1` → `sda`, `nvme0n1p2` → `nvme0n1`).
 fn parent_disk(class: &Path, device: &str) -> String {
@@ -296,6 +329,42 @@ mod tests {
         assert_eq!(device_details(&sys.0, "sda"), "HGST HMS5C4040BL · 3.6 TiB");
         assert_eq!(is_rotational(&sys.0, "sda"), Some(true));
         assert_eq!(device_details(&sys.0, "sdz"), "");
+    }
+
+    #[test]
+    fn physical_disks_see_through_partitions_and_multipath() {
+        // The god-server's layout: two partitions on one NVMe, and an ext4
+        // partition on a multipath disk reached through sdi.
+        let sys = FakeSys::new("physical");
+        sys.file("class/block/nvme1n1p1/partition", "1\n")
+            .file("class/block/nvme1n1p2/partition", "2\n")
+            .file("class/block/dm-1/dm/uuid", "mpath-35000cca26a2b6fd4\n")
+            .file("class/block/dm-1/dm/name", "mpathg\n")
+            .file("class/block/dm-1/slaves/sdi", "")
+            .file(
+                "class/block/dm-2/dm/uuid",
+                "part1-mpath-35000cca26a2b6fd4\n",
+            )
+            .file("class/block/dm-2/dm/name", "mpathg-part1\n")
+            .file("class/block/dm-2/slaves/dm-1", "")
+            .dir("class/block/sda");
+        let disks = |device| physical_disks(&sys.0, device);
+        assert_eq!(disks("nvme1n1p1"), vec!["nvme1n1"]);
+        assert_eq!(disks("nvme1n1p2"), vec!["nvme1n1"]);
+        assert_eq!(disks("dm-2"), vec!["mpathg"]);
+        assert_eq!(disks("sda"), vec!["sda"]);
+    }
+
+    #[test]
+    fn physical_disks_of_a_volume_spanning_two_disks() {
+        // An LVM volume over partitions on two disks.
+        let sys = FakeSys::new("lvm");
+        sys.file("class/block/dm-0/dm/uuid", "LVM-abc\n")
+            .file("class/block/dm-0/slaves/sdb1", "")
+            .file("class/block/dm-0/slaves/sdc1", "")
+            .file("class/block/sdb1/partition", "1\n")
+            .file("class/block/sdc1/partition", "1\n");
+        assert_eq!(physical_disks(&sys.0, "dm-0"), vec!["sdb", "sdc"]);
     }
 
     #[test]

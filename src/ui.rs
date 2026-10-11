@@ -10,7 +10,7 @@ use crate::app::App;
 use crate::flows::{FlowField, Route};
 use crate::format;
 use crate::layout::{self, Board, Panel, Point, RouteEnds};
-use crate::model::{ArrayLayout, Group, GroupKind, History, Member, Rate};
+use crate::model::{self, ArrayLayout, Group, GroupKind, History, Member, Rate};
 
 const READ_COLOR: Color = Color::Cyan;
 const WRITE_COLOR: Color = Color::Magenta;
@@ -85,7 +85,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
     let plans = plan_routes(&board, &app.field, groups);
     if app.show_flows {
         draw_flows(frame, body, &app.field, &plans);
-        draw_flow_list(frame, flow_list, &listed, groups);
+        draw_flow_list(frame, flow_list, &listed, groups, &app.field);
     }
     plans
         .iter()
@@ -96,7 +96,7 @@ pub fn draw(frame: &mut Frame, app: &App) -> Vec<Option<f64>> {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let groups = app.source.groups();
     let total: Rate = groups.iter().map(Group::current).sum();
-    let disks: usize = groups.iter().map(|g| g.members.len()).sum();
+    let disks = model::disk_count(groups);
     let arrays = groups.iter().filter(|g| g.is_array()).count();
 
     let mut spans = vec![
@@ -494,7 +494,13 @@ fn listed_flows(field: &FlowField) -> Vec<ListedFlow> {
     flows
 }
 
-fn draw_flow_list(frame: &mut Frame, area: Rect, flows: &[ListedFlow], groups: &[Group]) {
+fn draw_flow_list(
+    frame: &mut Frame,
+    area: Rect,
+    flows: &[ListedFlow],
+    groups: &[Group],
+    field: &FlowField,
+) {
     if area.is_empty() {
         return;
     }
@@ -519,7 +525,13 @@ fn draw_flow_list(frame: &mut Frame, area: Rect, flows: &[ListedFlow], groups: &
         .unwrap_or(0)
         .max(MIN_ROUTE_WIDTH);
 
-    let mut lines = vec![Line::from(" flows".dark_gray())];
+    // The scale, like the one on a map: what one dot stands for.
+    let fixed = if field.is_fixed() { " (fixed)" } else { "" };
+    let scale = format!(
+        " flows · each dot is {}{fixed}",
+        format::size_label(field.dot_size())
+    );
+    let mut lines = vec![Line::from(scale.dark_gray())];
     for (i, (flow, route)) in flows.iter().zip(&routes).enumerate() {
         let mut spans = vec![
             Span::styled(" ━━▶ ", Style::new().fg(flow.color)),
@@ -556,7 +568,7 @@ mod tests {
     fn demo_app_at(t: f64) -> App {
         let mut demo = Demo::new();
         demo.advance_to(t);
-        App::new(Box::new(demo), Duration::from_secs(1))
+        App::new(Box::new(demo), Duration::from_secs(1), None)
     }
 
     /// Draws `frames` frames, stepping the flows between them as the app does.
@@ -658,6 +670,21 @@ mod tests {
     }
 
     #[test]
+    fn flow_list_shows_what_each_dot_stands_for() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        animate(&mut terminal, &mut demo_app_at(10.0), 1);
+        let lines = screen(&terminal);
+        // The busiest demo copy is about 600 MiB/s, which gets 50 MiB dots.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("flows · each dot is 50 MiB")),
+            "{:?}",
+            lines.iter().find(|l| l.contains("flows"))
+        );
+    }
+
+    #[test]
     fn renders_at_any_size_without_panicking() {
         for (width, height) in [(160, 50), (78, 40), (30, 10), (5, 3), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -693,7 +720,7 @@ mod snapshot {
 
         let mut demo = crate::demo::Demo::new();
         demo.advance_to(at);
-        let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1));
+        let mut app = crate::app::App::new(Box::new(demo), Duration::from_secs(1), None);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         for _ in 0..120 {
             let mut lengths = Vec::new();

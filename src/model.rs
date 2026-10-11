@@ -124,6 +124,27 @@ pub struct Group {
     pub total_space: u64,
     pub available_space: u64,
     pub members: Vec<Member>,
+    /// The physical disks this group lives on, such as `nvme1n1` for both
+    /// `/` and `/boot/efi`. Empty when unknown, in which case each member
+    /// counts as its own disk.
+    pub physical_disks: Vec<String>,
+}
+
+/// How many physical disks the groups sit on, counting a disk shared by
+/// several groups (two partitions of one drive) once.
+pub fn disk_count(groups: &[Group]) -> usize {
+    let mut known: Vec<&str> = Vec::new();
+    let mut unknown = 0;
+    for group in groups {
+        if group.physical_disks.is_empty() {
+            unknown += group.members.len();
+        } else {
+            known.extend(group.physical_disks.iter().map(String::as_str));
+        }
+    }
+    known.sort_unstable();
+    known.dedup();
+    known.len() + unknown
 }
 
 impl Group {
@@ -199,6 +220,35 @@ mod tests {
     }
 
     #[test]
+    fn disks_shared_by_groups_count_once() {
+        let group = |disks: &[&str], members: usize| Group {
+            id: String::new(),
+            title: String::new(),
+            details: vec![],
+            kind: GroupKind::Standalone,
+            total_space: 0,
+            available_space: 0,
+            members: (0..members)
+                .map(|_| Member {
+                    name: String::new(),
+                    details: String::new(),
+                    history: History::default(),
+                })
+                .collect(),
+            physical_disks: disks.iter().map(|d| d.to_string()).collect(),
+        };
+        let groups = [
+            // `/` and `/boot/efi` on one NVMe.
+            group(&["nvme1n1"], 1),
+            group(&["nvme1n1"], 1),
+            group(&["sda", "sdb"], 2),
+            // A volume whose disks aren't known counts its members.
+            group(&[], 1),
+        ];
+        assert_eq!(disk_count(&groups), 4);
+    }
+
+    #[test]
     fn group_rate_sums_its_members() {
         let member = |read, write| {
             let mut history = History::default();
@@ -217,6 +267,7 @@ mod tests {
             total_space: 100,
             available_space: 25,
             members: vec![member(1.0, 10.0), member(2.0, 10.0)],
+            physical_disks: Vec::new(),
         };
         assert_eq!(
             group.current(),

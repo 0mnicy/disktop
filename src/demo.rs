@@ -268,6 +268,7 @@ fn standalone(mount: &str, details: &[&str], total: u64, used: f64) -> Group {
             details: String::new(),
             history: History::default(),
         }],
+        physical_disks: Vec::new(),
     }
 }
 
@@ -295,6 +296,7 @@ fn array(
                 history: History::default(),
             })
             .collect(),
+        physical_disks: Vec::new(),
     }
 }
 
