@@ -196,6 +196,9 @@ fn open_files(
         return Opened::default();
     };
     let mut opened = Opened::default();
+    // The group behind each mount, worked out once per mount rather than
+    // once per file, since a busy process can hold thousands of files.
+    let mut group_of: HashMap<u32, Option<&String>> = HashMap::new();
     for entry in entries.flatten() {
         let Some(fd) = entry
             .file_name()
@@ -213,7 +216,10 @@ fn open_files(
             continue;
         };
         // Files on /proc, tmpfs and the like don't map to a drive.
-        let Some(group) = devices.get(&kernel_name(source)) else {
+        let group = *group_of
+            .entry(info.mount_id)
+            .or_insert_with(|| sysfs::kernel_name(source).and_then(|name| devices.get(&name)));
+        let Some(group) = group else {
             continue;
         };
         positions.insert(fd, info.position);
@@ -390,15 +396,6 @@ fn parse_mountinfo(text: &str) -> HashMap<u32, String> {
             Some((id, source.to_string()))
         })
         .collect()
-}
-
-/// The kernel's name for a mount source: `sdb` for `/dev/sdb`, `dm-3` for
-/// `/dev/mapper/mpathh-part1`. Non-device sources come back as they are.
-fn kernel_name(source: &str) -> String {
-    let resolved = fs::canonicalize(source).unwrap_or_else(|_| PathBuf::from(source));
-    resolved
-        .file_name()
-        .map_or_else(|| source.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 fn read_text(path: &Path) -> Option<String> {

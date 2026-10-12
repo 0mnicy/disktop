@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::format;
 use crate::model::ArrayLayout;
@@ -96,6 +96,19 @@ fn custom_layout(profile: &str) -> ArrayLayout {
         summary: "multi-disk".to_string(),
         copies: 1,
     }
+}
+
+/// The kernel's name for a `/dev` device, such as `sdb` for `/dev/sdb` or
+/// `dm-2` for `/dev/mapper/mpathg-part1`. `None` for anything that isn't a
+/// device path, such as `tmpfs`, `overlay` or a Windows volume label.
+pub fn kernel_name(device: &str) -> Option<String> {
+    if !device.starts_with("/dev/") {
+        return None;
+    }
+    let resolved = fs::canonicalize(device).unwrap_or_else(|_| PathBuf::from(device));
+    resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Cumulative (bytes read, bytes written) per device, from `/proc/diskstats`.
@@ -334,6 +347,17 @@ mod tests {
         assert_eq!(btrfs_layout(Some("raid10")).level, "RAID 10");
         assert_eq!(btrfs_layout(Some("raid7")).level, "RAID7");
         assert_eq!(btrfs_layout(None).copies, 1);
+    }
+
+    #[test]
+    fn only_device_paths_have_a_kernel_name() {
+        assert_eq!(
+            kernel_name("/dev/mapper/not-on-this-machine").as_deref(),
+            Some("not-on-this-machine")
+        );
+        assert_eq!(kernel_name("Main Drive"), None);
+        assert_eq!(kernel_name("overlay"), None);
+        assert_eq!(kernel_name("tmpfs"), None);
     }
 
     #[test]
