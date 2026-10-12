@@ -62,16 +62,19 @@ ffmpeg, and a monospace font such as Cascadia Mono (pass another with
 Releases are built and published by the [release workflow](.github/workflows/release.yml)
 when a version tag is pushed.
 
-1. Set the new version in `Cargo.toml` and run `cargo check` to update
-   `Cargo.lock`.
+1. On a new branch, set the new version in `Cargo.toml` and run
+   `cargo check` to update `Cargo.lock`.
 2. In `CHANGELOG.md`, rename `Unreleased` to the version and today's date,
    start a new empty `Unreleased` section, and update the links at the bottom.
-3. Commit, then tag and push:
+3. Commit as `Release 0.2.0` and open a pull request. `main` only takes
+   changes that pass CI, so merge it once the checks are green.
+4. Tag the merged commit and push the tag:
 
    ```sh
-   git commit -am "Release 0.2.0"
+   git switch main
+   git pull
    git tag -a v0.2.0 -m "disktop 0.2.0"
-   git push origin main v0.2.0
+   git push origin v0.2.0
    ```
 
 The workflow checks that the tag matches `Cargo.toml`, builds static binaries
