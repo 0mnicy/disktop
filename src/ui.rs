@@ -1121,6 +1121,8 @@ mod tests {
 
 #[cfg(test)]
 mod snapshot {
+    use crate::model::{Flow, Group, Source};
+
     /// Prints the demo as text. Run with
     /// `cargo test print_demo -- --ignored --nocapture`; COLS and ROWS set
     /// the size, AT the second of the demo, and STYLE=arrows draws arrows.
@@ -1170,6 +1172,149 @@ mod snapshot {
             println!("--- {second}s");
             print_screen(&terminal);
         }
+    }
+
+    /// Records the demo frame by frame, for the animations in the README.
+    /// Time is simulated, so every run gives the same frames. Run with
+    /// `cargo test record_demo -- --ignored`; OUT names the file to write,
+    /// COLS and ROWS set the size, AT the second of the demo to start at,
+    /// SECS how long to record, FPS how many frames a second, and
+    /// STYLE=arrows draws arrows. `scripts/record.py` runs this and turns
+    /// the frames into GIFs.
+    ///
+    /// The file has a JSON line with the size and frame rate, then a JSON
+    /// line per frame: for each row, runs of cells drawn alike, as
+    /// `[text, foreground, background, modifier bits]`.
+    #[test]
+    #[ignore]
+    fn record_demo() {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        use crate::flows::FlowStyle;
+
+        /// Seconds of demo played before recording starts. Enough to fill
+        /// the graphs and run through every flow, so the flow list already
+        /// has its full height and doesn't push the panels up mid-recording.
+        const WARM_UP_SECS: u32 = 150;
+        /// The last part of the warm-up is animated, so the flows are in
+        /// full swing when recording starts.
+        const ANIMATED_WARM_UP_SECS: u32 = 10;
+
+        let out = std::env::var("OUT").expect("OUT names the file to write");
+        let (width, height) = (var("COLS", 120), var("ROWS", 40));
+        let (start, secs, fps) = (var("AT", 8u32), var("SECS", 10u32), var("FPS", 25u32));
+        let dt = 1.0 / f64::from(fps);
+
+        let warm_up_from = f64::from(start) - f64::from(WARM_UP_SECS);
+        let source = Scripted {
+            demo: crate::demo::Demo::new(),
+            at: warm_up_from - 1.0,
+        };
+        let mut app = crate::app::App::new(Box::new(source), Duration::from_secs(1), None, fps);
+        if std::env::var("STYLE").is_ok_and(|style| style == "arrows") {
+            app.field.set_style(FlowStyle::Arrows);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&out).unwrap());
+        writeln!(file, r#"{{"cols":{width},"rows":{height},"fps":{fps}}}"#).unwrap();
+
+        let sample = |app: &mut crate::app::App| {
+            app.source.sample();
+            app.field.sync(app.source.flows());
+            app.flow_list_rows = app.flow_list_rows.max(super::flow_list_rows(&app.field));
+        };
+        for _ in 0..WARM_UP_SECS - ANIMATED_WARM_UP_SECS {
+            sample(&mut app);
+        }
+        let animated = ANIMATED_WARM_UP_SECS + secs;
+        for frame in 0..animated * fps {
+            // A new sample at the start of each second, as the app takes them.
+            if frame % fps == 0 {
+                sample(&mut app);
+            }
+            let mut lengths = Vec::new();
+            terminal
+                .draw(|frame| lengths = super::draw(frame, &app))
+                .unwrap();
+            app.field.set_lengths(&lengths);
+            app.field.step(dt);
+
+            if frame >= ANIMATED_WARM_UP_SECS * fps {
+                let buffer = terminal.backend().buffer();
+                let mut rows = Vec::new();
+                for y in 0..buffer.area.height {
+                    let mut runs: Vec<(String, String)> = Vec::new();
+                    for x in 0..buffer.area.width {
+                        let cell = &buffer[(x, y)];
+                        let style = format!(
+                            r#""{:?}","{:?}",{}"#,
+                            cell.fg,
+                            cell.bg,
+                            cell.modifier.bits()
+                        );
+                        let symbol = cell.symbol().chars().next().unwrap_or(' ');
+                        match runs.last_mut() {
+                            Some((text, last)) if *last == style => text.push(symbol),
+                            _ => runs.push((symbol.to_string(), style)),
+                        }
+                    }
+                    let mut row = String::from("[");
+                    for (i, (text, style)) in runs.iter().enumerate() {
+                        let comma = if i == 0 { "" } else { "," };
+                        write!(row, "{comma}[{},{style}]", json_string(text)).unwrap();
+                    }
+                    row.push(']');
+                    rows.push(row);
+                }
+                writeln!(file, "[{}]", rows.join(",")).unwrap();
+            }
+        }
+        file.flush().unwrap();
+    }
+
+    /// The demo on a simulated clock that moves a second per sample.
+    struct Scripted {
+        demo: crate::demo::Demo,
+        at: f64,
+    }
+
+    impl Source for Scripted {
+        fn sample(&mut self) {
+            self.at += 1.0;
+            self.demo.advance_to(self.at);
+        }
+
+        fn groups(&self) -> &[Group] {
+            self.demo.groups()
+        }
+
+        fn flows(&self) -> &[Flow] {
+            self.demo.flows()
+        }
+
+        fn badge(&self) -> Option<&str> {
+            self.demo.badge()
+        }
+    }
+
+    /// `text` as a JSON string.
+    fn json_string(text: &str) -> String {
+        let mut json = String::from('"');
+        for c in text.chars() {
+            match c {
+                '"' => json.push_str("\\\""),
+                '\\' => json.push_str("\\\\"),
+                c if u32::from(c) < 0x20 => json.push_str(&format!("\\u{:04x}", u32::from(c))),
+                c => json.push(c),
+            }
+        }
+        json.push('"');
+        json
     }
 
     /// An environment variable, or `default` when it's missing or invalid.
