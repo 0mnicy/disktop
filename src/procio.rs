@@ -278,7 +278,8 @@ fn connected(dir: &Path, sockets: &HashSet<u64>) -> bool {
 /// The group shares on one side of a process's open files: how the bytes
 /// it read (or wrote) divide between drives. Files opened for just that
 /// side are used when there are any; otherwise files opened for reading
-/// and writing, which is how torrent clients open the data they share.
+/// and writing, which is how sync programs open files they both send and
+/// receive.
 fn shares(files: &[OpenFile], side: Side) -> Vec<(String, f64)> {
     let only: Vec<&OpenFile> = files.iter().filter(|f| f.only(side)).collect();
     let side: Vec<&OpenFile> = if only.is_empty() {
@@ -471,7 +472,7 @@ mod tests {
             writes: true,
             moved: 0,
         };
-        // A torrent client's data file, alone: it counts on both sides.
+        // A sync program's file, alone: it counts on both sides.
         let alone = std::slice::from_ref(&both);
         assert_eq!(shares(alone, Side::Reading), vec![("/main".into(), 1.0)]);
         assert_eq!(shares(alone, Side::Writing), vec![("/main".into(), 1.0)]);
@@ -572,9 +573,9 @@ mod tests {
     impl FakeProc {
         /// A process writing `progress` bytes to /main, with `received`
         /// bytes arrived on its container's network over a TCP connection
-        /// (fd 7, inode 333), while also reading `seeding` bytes from /main
+        /// (fd 7, inode 333), while also reading `sending` bytes from /main
         /// for someone else.
-        fn downloader(&self, pid: u32, progress: u64, received: u64, seeding: u64, remote: bool) {
+        fn downloader(&self, pid: u32, progress: u64, received: u64, sending: u64, remote: bool) {
             self.connection(pid, remote);
             self.write(
                 &format!("{pid}/net/dev"),
@@ -582,10 +583,10 @@ mod tests {
                     "Inter-|\n face |\n    lo: 500 1 0 0 0 0 0 0 500 1 0 0 0 0 0 0\n  eth0: {received} 1 0 0 0 0 0 0 0 1 0 0 0 0 0 0\n"
                 ),
             );
-            self.write(&format!("{pid}/comm"), "qbittorrent\n");
+            self.write(&format!("{pid}/comm"), "syncthing\n");
             self.write(
                 &format!("{pid}/io"),
-                &format!("read_bytes: {seeding}\nwrite_bytes: {progress}\n"),
+                &format!("read_bytes: {sending}\nwrite_bytes: {progress}\n"),
             );
             self.write(
                 &format!("{pid}/mountinfo"),
@@ -621,11 +622,11 @@ mod tests {
             );
         }
 
-        /// A media server that has read `progress` bytes from /main and its
+        /// A web server that has read `progress` bytes from /main and its
         /// container's network has sent `sent` bytes.
         fn streamer(&self, pid: u32, progress: u64, sent: u64) {
             self.connection(pid, true);
-            self.write(&format!("{pid}/comm"), "Plex Media Serv\n");
+            self.write(&format!("{pid}/comm"), "nginx\n");
             self.write(
                 &format!("{pid}/io"),
                 &format!("read_bytes: {progress}\nwrite_bytes: 4096\n"),
@@ -655,7 +656,7 @@ mod tests {
         // A first second of writing, to learn what its network had received.
         proc.downloader(77, 10 * MIB, 10 * MIB, 0, true);
         tracer.sample(Some(1.0), &devices, &[]);
-        // 50 MiB/s down while seeding 30 MiB/s from the same drive: reading
+        // 50 MiB/s down while sending 30 MiB/s from the same drive: reading
         // the drive it writes to isn't a copy, so all 50 came from outside.
         proc.downloader(77, 60 * MIB, 60 * MIB, 30 * MIB, true);
         let flows = tracer.sample(Some(1.0), &devices, &[]);
@@ -665,7 +666,7 @@ mod tests {
                 from: NETWORK.into(),
                 to: "/main".into(),
                 rate: (50 * MIB) as f64,
-                process: "qbittorrent".into(),
+                process: "syncthing".into(),
             }]
         );
     }
@@ -724,7 +725,7 @@ mod tests {
                 from: "/main".into(),
                 to: NETWORK.into(),
                 rate: (20 * MIB) as f64,
-                process: "Plex Media Serv".into(),
+                process: "nginx".into(),
             }]
         );
     }
