@@ -30,6 +30,21 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Time",
 ] }
 
+# Lets `cargo binstall disktop` download a release's prebuilt binary instead
+# of building from source. Matches the archives the release workflow makes.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
 

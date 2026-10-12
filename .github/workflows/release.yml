@@ -1,8 +1,9 @@
 name: Release
 
-# Pushing a version tag such as `v0.2.0` builds disktop for every target and
-# publishes the archives as a GitHub release, with the notes for that
-# version from CHANGELOG.md. See "Releasing" in CONTRIBUTING.md.
+# Pushing a version tag such as `v0.2.0` builds disktop for every target,
+# publishes the archives as a GitHub release with the notes for that version
+# from CHANGELOG.md, then publishes the crate to crates.io. See "Releasing"
+# in CONTRIBUTING.md.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
@@ -164,3 +165,25 @@ jobs:
             --title "disktop $version" \
             --notes-file notes.md \
             $prerelease
+
+  crates-io:
+    name: Publish to crates.io
+    # After the GitHub release, so `cargo binstall` finds its archives as
+    # soon as the version appears on crates.io.
+    needs: publish
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # to get a short-lived crates.io token
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Trusted publishing: crates.io checks the request comes from this
+      # repository's release workflow, so no API token is stored here.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

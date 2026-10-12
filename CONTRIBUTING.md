@@ -80,7 +80,13 @@ when a version tag is pushed.
 The workflow checks that the tag matches `Cargo.toml`, builds static binaries
 for Windows and Linux on x86-64 and ARM64, and publishes them with checksums,
 build provenance and that version's notes from the changelog. A version with a
-suffix, such as `0.2.0-rc.1`, is published as a prerelease.
+suffix, such as `0.2.0-rc.1`, is published as a prerelease. It then publishes
+the crate to crates.io using [trusted publishing](https://crates.io/docs/trusted-publishing),
+so no API token is stored in the repository.
+
+A version on crates.io can never be changed, only yanked, so a release is
+worth checking before its tag is pushed: `cargo publish --dry-run` shows what
+would be published and checks that it builds.
 
 ## License
 

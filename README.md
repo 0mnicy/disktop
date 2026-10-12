@@ -5,6 +5,7 @@
 </p>
 
 <p align="center">
+  <a href="https://crates.io/crates/disktop"><img alt="crates.io" src="https://img.shields.io/crates/v/disktop"></a>
   <a href="https://github.com/0mnicy/disktop/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/0mnicy/disktop"></a>
   <a href="https://github.com/0mnicy/disktop/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/0mnicy/disktop/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Rust 1.95 or newer" src="https://img.shields.io/badge/rust-1.95%2B-orange">
@@ -57,9 +58,25 @@ For ARM64, swap `x86_64` for `aarch64`. Each release lists SHA-256
 checksums, and its archives carry [build provenance](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations)
 you can check with `gh attestation verify <archive> --repo 0mnicy/disktop`.
 
+### With Cargo
+
+With [Rust](https://rustup.rs) 1.95 or newer, install from
+[crates.io](https://crates.io/crates/disktop):
+
+```sh
+cargo install disktop
+```
+
+Or, with [cargo-binstall](https://github.com/cargo-bins/cargo-binstall),
+download the prebuilt binary instead of building it:
+
+```sh
+cargo binstall disktop
+```
+
 ### From source
 
-You need [Rust](https://rustup.rs) 1.95 or newer.
+To install the latest code, including changes not yet released:
 
 ```sh
 cargo install --git https://github.com/0mnicy/disktop

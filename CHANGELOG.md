@@ -6,6 +6,12 @@ All notable changes to disktop are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Releases are published to crates.io, so disktop installs with
+  `cargo install disktop`, and `cargo binstall disktop` downloads the
+  prebuilt binary for your system.
+
 ## [0.1.0] - 2026-10-11
 
 The first release.
