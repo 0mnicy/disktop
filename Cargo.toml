@@ -9,6 +9,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/0mnicy/disktop"
 keywords = ["disk", "io", "monitor", "tui", "top"]
 categories = ["command-line-utilities"]
+# Keep the published crate to the source; the rest is for the repository.
+exclude = ["/.github", "/assets", "/scripts"]
 
 [dependencies]
 anyhow = "1.0.104"
