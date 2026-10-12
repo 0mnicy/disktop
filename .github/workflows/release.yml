@@ -1,0 +1,166 @@
+name: Release
+
+# Pushing a version tag such as `v0.2.0` builds disktop for every target and
+# publishes the archives as a GitHub release, with the notes for that
+# version from CHANGELOG.md. See "Releasing" in CONTRIBUTING.md.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # Builds the archives without publishing them, so a change to this file is
+  # tested before the next tag relies on it.
+  pull_request:
+    paths: [.github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          # musl builds are fully static, so they run on any distribution.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Check the tag matches the version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          # On Windows, link the C runtime in, so the Visual C++
+          # Redistributable isn't needed.
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check the binary runs
+        # Windows on ARM can't run on this x86-64 runner.
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: target/${{ matrix.target }}/release/disktop --version
+
+      - name: Package
+        shell: bash
+        run: |
+          name=disktop-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "../target/${{ matrix.target }}/release/disktop.exe" "$name/"
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            cp "../target/${{ matrix.target }}/release/disktop" "$name/"
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+          ls -l
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release
+      id-token: write # to sign the provenance attestation
+      attestations: write # to store it
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # Lets anyone check that an archive was built here, from this commit:
+      # `gh attestation verify <archive> --repo <owner>/<repo>`.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # The section for this version, without its heading or the link
+          # definitions at the end of the file.
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && !/^\[[^]]*\]: / { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no notes for $version"
+            exit 1
+          fi
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          Download the archive for your system below, unpack it, and run \`disktop\`.
+          The Linux builds are static and run on any distribution. To check a download:
+
+          \`\`\`sh
+          sha256sum --check --ignore-missing SHA256SUMS
+          gh attestation verify disktop-x86_64-unknown-linux-musl.tar.gz --repo $GITHUB_REPOSITORY
+          \`\`\`
+          EOF
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          # Versions such as 0.2.0-rc.1 are prereleases.
+          prerelease=$([[ "$version" == *-* ]] && echo --prerelease || true)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "disktop $version" \
+            --notes-file notes.md \
+            $prerelease
