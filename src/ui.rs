@@ -154,8 +154,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         spans.extend(["  ".into(), format!(" {badge} ").black().on_yellow()]);
     }
     let left = Line::from(spans);
-    let right = Line::from(format!("every {:.1}s ", app.interval.as_secs_f64()))
-        .dark_gray()
+    // The style goes on the text rather than the line, since a line's own
+    // style recolors the whole row, including what's drawn on the left.
+    let right = Line::from(format!("every {:.1}s ", app.interval.as_secs_f64()).dark_gray())
         .right_aligned();
 
     // On a narrow terminal the interval gives way rather than overlapping.
@@ -173,7 +174,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let other = app.field.style().toggled().name();
     keys.extend(["a".bold(), format!(" {other}   ").dark_gray()]);
     keys.extend(["p".bold(), " pause".dark_gray()]);
-    frame.render_widget(Line::from(keys), area);
+    let keys = Line::from(keys);
 
     let mut state = Vec::new();
     if !app.show_flows {
@@ -184,21 +185,37 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
     let line = if state.is_empty() {
         // With nothing more pressing to say, say what limits the flows.
-        match app.source.flow_note() {
-            Some(note) => Line::from(format!("{note} ")).dark_gray(),
-            None => return,
-        }
+        app.source
+            .flow_note()
+            .map(|note| Line::from(format!("{note} ").dark_gray()))
     } else {
-        Line::from(format!("{} ", state.join(" · "))).yellow()
+        Some(Line::from(format!("{} ", state.join(" · ")).yellow()))
     };
-    frame.render_widget(line.right_aligned(), area);
+
+    let keys_width = keys.width();
+    frame.render_widget(keys, area);
+    // Like the header, a narrow terminal drops the right side rather than
+    // writing it over the keys.
+    if let Some(line) = line
+        && keys_width + line.width() < usize::from(area.width)
+    {
+        frame.render_widget(line.right_aligned(), area);
+    }
+}
+
+/// A rounded box with a border in `color` and `title` along the top.
+fn panel_block(color: Color, title: Line<'static>) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(color))
+        // The title is drawn over the border; without this, the parts of it
+        // with no color of their own would take the border's.
+        .title_style(Style::new().fg(Color::Reset))
+        .title(title)
 }
 
 fn draw_standalone(frame: &mut Frame, area: Rect, group: &Group) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().dark_gray())
-        .title(group_title(group));
+    let block = panel_block(Color::DarkGray, group_title(group));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -220,10 +237,7 @@ fn draw_standalone(frame: &mut Frame, area: Rect, group: &Group) {
 
 /// The network: data received and sent, with a graph, and no capacity.
 fn draw_network(frame: &mut Frame, area: Rect, group: &Group) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().dark_gray())
-        .title(group_title(group));
+    let block = panel_block(Color::DarkGray, group_title(group));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -241,11 +255,7 @@ fn draw_network(frame: &mut Frame, area: Rect, group: &Group) {
 }
 
 fn draw_array(frame: &mut Frame, panel: &Panel, group: &Group, array: &ArrayLayout) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ARRAY_COLOR))
-        .title(group_title(group));
-    frame.render_widget(block, panel.area);
+    frame.render_widget(panel_block(ARRAY_COLOR, group_title(group)), panel.area);
 
     let parts = layout::array_parts(panel.area, group.members.len(), panel.channel_side);
     let [capacity, status] =
@@ -282,16 +292,16 @@ fn draw_array(frame: &mut Frame, panel: &Panel, group: &Group, array: &ArrayLayo
 }
 
 fn draw_member(frame: &mut Frame, area: Rect, member: &Member) {
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().dark_gray())
-        .title(Line::from(vec![
+    let block = panel_block(
+        Color::DarkGray,
+        Line::from(vec![
             " ".into(),
             member.name.clone().bold(),
             "  ".into(),
             member.details.clone().dark_gray(),
             " ".into(),
-        ]));
+        ]),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -793,6 +803,7 @@ mod tests {
 
     use super::*;
     use crate::demo::Demo;
+    use crate::model::Source;
 
     fn demo_app_at(t: f64) -> App {
         let mut demo = Demo::new();
@@ -877,6 +888,77 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
         animate(&mut terminal, &mut demo_app_at(10.0), 1);
         assert!(screen(&terminal)[0].contains("every 1.0s"));
+    }
+
+    /// The demo with a caveat about flows, like a run without root.
+    struct Caveated(Demo);
+
+    impl Source for Caveated {
+        fn sample(&mut self) {
+            self.0.sample();
+        }
+
+        fn groups(&self) -> &[Group] {
+            self.0.groups()
+        }
+
+        fn flows(&self) -> &[model::Flow] {
+            self.0.flows()
+        }
+
+        fn flow_note(&self) -> Option<&str> {
+            Some("flows: your processes only · run with sudo to see all")
+        }
+    }
+
+    #[test]
+    fn footer_drops_the_note_instead_of_overlapping_the_keys() {
+        let footer_at = |width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+            let mut app = App::new(
+                Box::new(Caveated(Demo::new())),
+                Duration::from_secs(1),
+                None,
+                20,
+            );
+            animate(&mut terminal, &mut app, 1);
+            screen(&terminal).last().unwrap().clone()
+        };
+        let narrow = footer_at(80);
+        assert!(
+            narrow.contains("q quit") && narrow.contains("p pause"),
+            "{narrow}"
+        );
+        assert!(!narrow.contains("sudo"), "{narrow}");
+        assert!(footer_at(120).contains("run with sudo to see all"));
+    }
+
+    #[test]
+    fn text_keeps_its_own_colors() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        let mut app = demo_app_at(10.0);
+        app.paused = true;
+        animate(&mut terminal, &mut app, 1);
+        let lines = screen(&terminal);
+        let buffer = terminal.backend().buffer();
+        let cell_at = |row: usize, text: &str| {
+            let line = &lines[row];
+            let column = line[..line.find(text).unwrap()].chars().count();
+            buffer[(column as u16, row as u16)].clone()
+        };
+
+        // The interval at the right of the header doesn't recolor the rates.
+        assert_eq!(cell_at(0, "● read").fg, READ_COLOR);
+        assert_eq!(cell_at(0, "● write").fg, WRITE_COLOR);
+        assert_eq!(cell_at(0, "demo").fg, Color::Black);
+        // Nor does "paused" at the right of the footer recolor the keys.
+        let footer = lines.len() - 1;
+        assert_eq!(cell_at(footer, "q quit").fg, Color::Reset);
+        assert_eq!(cell_at(footer, "paused").fg, Color::Yellow);
+        // A panel's title stands out from its border and details.
+        let title = lines.iter().position(|l| l.contains("Network")).unwrap();
+        assert_eq!(cell_at(title, "Network").fg, Color::Reset);
+        assert_eq!(cell_at(title, "Ethernet").fg, Color::DarkGray);
     }
 
     #[test]
