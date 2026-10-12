@@ -110,7 +110,7 @@ impl DriveMonitor {
             .iter()
             .map(|d| {
                 let device = d.name().to_string_lossy().into_owned();
-                let kernel = kernel_name(&device);
+                let kernel = sysfs::kernel_name(&device);
                 let array = kernel
                     .as_deref()
                     .and_then(|name| array_of.get(name).copied());
@@ -337,18 +337,6 @@ struct MountInfo<'a> {
     /// labels, which can repeat) never merges.
     key: Option<&'a str>,
     file_system: &'a str,
-}
-
-/// The kernel's name for a `/dev` device, such as `sdb` for `/dev/sdb` or
-/// `dm-2` for `/dev/mapper/mpathg-part1`.
-fn kernel_name(device: &str) -> Option<String> {
-    if !device.starts_with("/dev/") {
-        return None;
-    }
-    let resolved = std::fs::canonicalize(device).unwrap_or_else(|_| device.into());
-    resolved
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// Picks the mounts to show, as indices into `mounts`, each with how many
@@ -644,12 +632,6 @@ mod tests {
             "first sight"
         );
         assert_eq!(next.len(), 2, "both counters kept for next time");
-    }
-
-    #[test]
-    fn non_dev_names_have_no_kernel_name() {
-        assert_eq!(kernel_name("Main Drive"), None);
-        assert_eq!(kernel_name("overlay"), None);
     }
 
     #[test]
