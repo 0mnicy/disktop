@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn writes_beyond_a_copy_are_a_download_up_to_what_was_received() {
-        // A torrent client downloading 50 and sharing 30, all on one drive.
+        // A sync program receiving 50 and sending 30, all on one drive.
         let flows = flows_of(&io(&[("/main", 30.0)], &[("/main", 50.0)], 80.0, 30.0));
         assert_eq!(
             flows,

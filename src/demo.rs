@@ -64,7 +64,7 @@ const SCRIPT: [ScriptedFlow; 6] = [
         start: 8.0,
         end: 40.0,
         rate: 45.0 * MIB,
-        process: "qbittorrent.exe",
+        process: "steam.exe",
     },
     ScriptedFlow {
         from: "M:\\",
@@ -72,7 +72,7 @@ const SCRIPT: [ScriptedFlow; 6] = [
         start: 4.0,
         end: 52.0,
         rate: 12.0 * MIB,
-        process: "Plex Media Server.exe",
+        process: "OneDrive.exe",
     },
 ];
 
