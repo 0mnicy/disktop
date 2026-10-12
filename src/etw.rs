@@ -22,14 +22,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SUCCESS, GetLastError};
 use windows::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
     EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
     EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
     PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
-    TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW, TRACE_LEVEL_INFORMATION,
+    WNODE_FLAG_TRACED_GUID,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{GUID, HSTRING, PWSTR};
@@ -232,6 +232,7 @@ fn slot_of(ticks: i64) -> i64 {
     static FREQUENCY: OnceLock<i64> = OnceLock::new();
     let frequency = *FREQUENCY.get_or_init(|| {
         let mut frequency = 0;
+        // SAFETY: only writes the frequency into the given integer.
         let _ = unsafe { QueryPerformanceFrequency(&mut frequency) };
         frequency.max(1)
     });
@@ -241,6 +242,7 @@ fn slot_of(ticks: i64) -> i64 {
 /// The time slot it is now.
 fn now_slot() -> i64 {
     let mut ticks = 0;
+    // SAFETY: only writes the reading into the given integer.
     let _ = unsafe { QueryPerformanceCounter(&mut ticks) };
     slot_of(ticks)
 }
@@ -467,7 +469,14 @@ fn is_loopback(address: &[u8]) -> bool {
 }
 
 /// Called by ETW on its own thread for every event.
+///
+/// # Safety
+///
+/// `record` must be null or point to an event record, valid for the
+/// duration of the call, whose `UserData` holds `UserDataLength` bytes.
+/// ETW guarantees this for the callbacks it makes.
 unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
+    // SAFETY: the caller passes a valid record or null.
     let Some(record) = (unsafe { record.as_ref() }) else {
         return;
     };
@@ -475,9 +484,11 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     let data: &[u8] = if record.UserData.is_null() {
         &[]
     } else {
+        // SAFETY: the caller guarantees `UserData` holds `UserDataLength`
+        // bytes, which stay put until the callback returns.
         unsafe {
             std::slice::from_raw_parts(
-                record.UserData as *const u8,
+                record.UserData.cast::<u8>(),
                 usize::from(record.UserDataLength),
             )
         }
@@ -502,6 +513,13 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     }
 }
 
+/// What `OpenTraceW` returns when it fails (`INVALID_PROCESSTRACE_HANDLE`).
+const INVALID_TRACE: u64 = u64::MAX;
+
+// The properties are built in a buffer of `u64`s, which must be aligned
+// enough to hold them.
+const _: () = assert!(align_of::<EVENT_TRACE_PROPERTIES>() <= align_of::<u64>());
+
 /// `EVENT_TRACE_PROPERTIES` followed by room for the session name, as
 /// `StartTraceW` and `ControlTraceW` want it. Kept in `u64`s so the struct
 /// is properly aligned.
@@ -509,40 +527,52 @@ fn session_properties() -> Vec<u64> {
     let header = size_of::<EVENT_TRACE_PROPERTIES>();
     let total = header + (SESSION.len() + 1) * 2;
     let mut buffer = vec![0u64; total.div_ceil(8)];
-    let properties = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
-    unsafe {
-        (*properties).Wnode.BufferSize = total as u32;
-        (*properties).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        // Timestamps from the performance counter.
-        (*properties).Wnode.ClientContext = 1;
-        (*properties).LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        (*properties).LoggerNameOffset = header as u32;
-        // Small buffers flushed every second, so events arrive promptly.
-        (*properties).BufferSize = 16;
-        (*properties).FlushTimer = 1;
-    }
+    // SAFETY: the buffer is at least `header` bytes, zeroed (a valid value
+    // for this plain C struct) and aligned for it, as checked above.
+    let properties = unsafe { &mut *buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>() };
+    properties.Wnode.BufferSize = total as u32;
+    properties.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    // Timestamps from the performance counter.
+    properties.Wnode.ClientContext = 1;
+    properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+    properties.LoggerNameOffset = header as u32;
+    // Small buffers flushed every second, so events arrive promptly.
+    properties.BufferSize = 16;
+    properties.FlushTimer = 1;
     buffer
 }
 
-/// Starts the session, with `callback` called for every event.
+/// Starts the session, with `callback` called for every event. On failure
+/// it returns the Windows error code and leaves no session running.
 fn start_session(callback: unsafe extern "system" fn(*mut EVENT_RECORD)) -> Result<(), u32> {
     stop_session();
     let mut properties = session_properties();
     let mut session = CONTROLTRACE_HANDLE::default();
-    unsafe {
-        let started = StartTraceW(
+    // SAFETY: `properties` is laid out as the call expects (see
+    // `session_properties`) and outlives it.
+    let started = unsafe {
+        StartTraceW(
             &mut session,
             &HSTRING::from(SESSION),
-            properties.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
-        );
-        if started != ERROR_SUCCESS {
-            return Err(started.0);
-        }
-        for (provider, keywords) in [
-            (FILE_PROVIDER, FILE_KEYWORDS),
-            (NETWORK_PROVIDER, NETWORK_KEYWORDS),
-        ] {
-            let enabled = EnableTraceEx2(
+            properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+        )
+    };
+    if started != ERROR_SUCCESS {
+        return Err(started.0);
+    }
+    // From here on the session is running, so a failure stops it again.
+    let fail = |code: u32| {
+        stop_session();
+        Err(code)
+    };
+
+    for (provider, keywords) in [
+        (FILE_PROVIDER, FILE_KEYWORDS),
+        (NETWORK_PROVIDER, NETWORK_KEYWORDS),
+    ] {
+        // SAFETY: `session` was just started, and `provider` outlives the call.
+        let enabled = unsafe {
+            EnableTraceEx2(
                 session,
                 &provider,
                 EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
@@ -551,51 +581,63 @@ fn start_session(callback: unsafe extern "system" fn(*mut EVENT_RECORD)) -> Resu
                 0,
                 0,
                 None,
-            );
-            if enabled != ERROR_SUCCESS {
-                stop_session();
-                return Err(enabled.0);
-            }
-        }
-
-        let mut name: Vec<u16> = SESSION.encode_utf16().chain([0]).collect();
-        let mut logfile = EVENT_TRACE_LOGFILEW {
-            LoggerName: PWSTR(name.as_mut_ptr()),
-            ..Default::default()
+            )
         };
-        // Raw timestamps leave event times as performance-counter readings.
-        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
-            | PROCESS_TRACE_MODE_EVENT_RECORD
-            | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
-        logfile.Anonymous2.EventRecordCallback = Some(callback);
-        let consumer = OpenTraceW(&mut logfile);
-        if consumer.Value == u64::MAX {
-            stop_session();
-            return Err(u32::MAX);
+        if enabled != ERROR_SUCCESS {
+            return fail(enabled.0);
         }
-        let consumer = consumer.Value;
-        // ProcessTrace delivers events until the session stops.
-        thread::Builder::new()
-            .name("etw".to_string())
-            .spawn(move || {
-                let handle = PROCESSTRACE_HANDLE { Value: consumer };
-                let _ = ProcessTrace(&[handle], None, None);
-            })
-            .map_err(|_| u32::MAX)?;
+    }
+
+    let mut name: Vec<u16> = SESSION.encode_utf16().chain([0]).collect();
+    let mut logfile = EVENT_TRACE_LOGFILEW {
+        LoggerName: PWSTR(name.as_mut_ptr()),
+        ..Default::default()
+    };
+    // Raw timestamps leave event times as performance-counter readings.
+    logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
+        | PROCESS_TRACE_MODE_EVENT_RECORD
+        | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
+    logfile.Anonymous2.EventRecordCallback = Some(callback);
+    // SAFETY: `logfile` is fully set up, and the session name it points to
+    // is nul-terminated and outlives the call.
+    let consumer = unsafe { OpenTraceW(&mut logfile) };
+    if consumer.Value == INVALID_TRACE {
+        // SAFETY: reads this thread's last error, which OpenTraceW just set.
+        return fail(unsafe { GetLastError() }.0);
+    }
+
+    // ProcessTrace delivers events until the session stops.
+    let spawned = thread::Builder::new()
+        .name("etw".to_string())
+        .spawn(move || {
+            // SAFETY: `consumer` was opened above and is used by this thread
+            // alone, which closes it once the trace ends.
+            unsafe {
+                let _ = ProcessTrace(&[consumer], None, None);
+                let _ = CloseTrace(consumer);
+            }
+        });
+    if let Err(error) = spawned {
+        // SAFETY: no thread got to use the handle, so it's closed here.
+        let _ = unsafe { CloseTrace(consumer) };
+        return fail(error.raw_os_error().map_or(u32::MAX, |code| code as u32));
     }
     Ok(())
 }
 
 fn stop_session() {
     let mut properties = session_properties();
-    unsafe {
-        let _ = ControlTraceW(
+    // SAFETY: `properties` is laid out as the call expects (see
+    // `session_properties`) and outlives it. Stopping a session that isn't
+    // running just fails.
+    let _ = unsafe {
+        ControlTraceW(
             CONTROLTRACE_HANDLE::default(),
             &HSTRING::from(SESSION),
-            properties.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES,
+            properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
             EVENT_TRACE_CONTROL_STOP,
-        );
-    }
+        )
+    };
 }
 
 #[cfg(test)]
@@ -614,6 +656,9 @@ mod tests {
             ..Default::default()
         };
         let mut size = 0u32;
+        // SAFETY: the first call only reports the size the second needs.
+        // The buffer is that big and aligned for TRACE_EVENT_INFO, and the
+        // property array and names it describes lie within it.
         unsafe {
             TdhGetManifestEventInformation(&provider, &descriptor, None, &mut size);
             let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
@@ -971,7 +1016,9 @@ mod tests {
         EVENTS.get_or_init(Mutex::default)
     }
 
+    /// Like [`on_event`], with the same safety requirements.
     unsafe extern "system" fn collect_event(record: *mut EVENT_RECORD) {
+        // SAFETY: the caller passes a valid record or null.
         let Some(record) = (unsafe { record.as_ref() }) else {
             return;
         };
@@ -979,6 +1026,7 @@ mod tests {
         if header.ProviderId != FILE_PROVIDER || header.EventDescriptor.Version != 1 {
             return;
         }
+        // SAFETY: the caller guarantees `UserData` holds `UserDataLength` bytes.
         let data = unsafe {
             std::slice::from_raw_parts(
                 record.UserData as *const u8,
@@ -1017,10 +1065,11 @@ mod tests {
     #[test]
     #[ignore]
     fn print_events() {
+        use std::os::windows::process::CommandExt;
+
         let command = std::env::var("CMD").expect("CMD to run");
         start_session(collect_event).expect("run as Administrator");
         thread::sleep(std::time::Duration::from_secs(2));
-        use std::os::windows::process::CommandExt;
 
         // Passed as written, since cmd doesn't follow the usual quoting.
         let mut child = std::process::Command::new("cmd")
