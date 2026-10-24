@@ -18,6 +18,7 @@
 
 use std::collections::VecDeque;
 
+use crate::format::round_sizes;
 use crate::model::Flow;
 
 /// How fast every dot moves, in cells per second.
@@ -285,17 +286,6 @@ impl FlowField {
             .find(|c| self.routes.iter().all(|r| r.color != *c))
             .unwrap()
     }
-}
-
-/// Round dot sizes, smallest first: 1, 2, 5, 10, 20, 50, 100, 200, 500 of
-/// each binary unit from KiB to TiB.
-fn round_sizes() -> impl Iterator<Item = f64> {
-    (1..=4).flat_map(|power| {
-        let unit = 1024f64.powi(power);
-        [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
-            .into_iter()
-            .map(move |step| step * unit)
-    })
 }
 
 /// Keeps `current` while the busiest flow shows a comfortable number of

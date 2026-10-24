@@ -23,7 +23,9 @@ When a program copies files from one drive to another, disktop draws it as
 dots marching from one panel to the other and names the program. Downloads
 and uploads run to and from a Network panel the same way.
 
-- **Live graphs** of every drive's reads and writes, and of the network.
+- **Live graphs** of every drive's reads and writes, and of the network,
+  each with a scale showing the rate at its top: a round number such as
+  50 MiB/s, just above the busiest recent moment.
 - **Arrays as one panel**, with a graph per member disk. On Linux, btrfs
   filesystems that span several disks are found and grouped this way.
 - **Copies, downloads and uploads**, traced to the program doing them: from
@@ -114,9 +116,11 @@ still work, and the footer says what's missing.
 
 ## Reading the flow view
 
-Each copy between drives gets its own color, a dim dotted track showing its
-route, and bright dots moving along it from source to destination. Each dot
-trails a short dim tail, so it points the way the data is going. Every flow
+Each copy between drives runs along a faint gray dotted track showing its
+route, with dots in its own color moving from source to destination. Each
+dot is a thick bright head trailing a short dim tail, so it stands out even
+on a short hop between neighbouring panels and points the way the data is
+going. Every flow
 leaves and enters a panel at its own point and runs in its own lane in the
 channel between the columns, so streams don't pile on top of each other.
 

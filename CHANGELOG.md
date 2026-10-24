@@ -8,9 +8,26 @@ All notable changes to disktop are recorded here. The format follows
 
 ### Added
 
+- Each graph has a scale on its left, so you can tell what it's showing:
+  the rate at its top, a round number such as 50 MiB/s just above the
+  busiest recent moment, and zero at the bottom.
 - Releases are published to crates.io, so disktop installs with
   `cargo install disktop`, and `cargo binstall disktop` downloads the
   prebuilt binary for your system.
+
+### Changed
+
+- Graphs top out at that round number rather than a little above their
+  peak, so they can be read against the scale.
+- Flow dots are easier to see, even on a short hop between neighbouring
+  panels: each has a thick bright head, and the tracks they run along are
+  drawn in faint gray, so only what's moving is in color.
+
+### Fixed
+
+- Terminals that outline the cursor while they're not focused, even when
+  it's hidden, no longer show it sitting on a moving flow: disktop parks it
+  in the bottom-right corner after each frame.
 
 ## [0.1.0] - 2026-10-11
 
