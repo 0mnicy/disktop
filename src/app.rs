@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::cursor::MoveTo;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::crossterm::{execute, queue};
@@ -68,7 +69,20 @@ impl App {
             let drawing = Instant::now();
             let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
             let mut route_lengths = Vec::new();
-            terminal.draw(|frame| route_lengths = ui::draw(frame, self))?;
+            let mut screen = ratatui::layout::Rect::default();
+            terminal.draw(|frame| {
+                screen = frame.area();
+                route_lengths = ui::draw(frame, self);
+            })?;
+            // The cursor is hidden, but some terminals still outline it when
+            // they're not focused, and it's left wherever the frame last
+            // drew, often on a moving flow. Park it in the bottom-right
+            // corner, at the empty end of the footer.
+            let corner = MoveTo(
+                screen.right().saturating_sub(1),
+                screen.bottom().saturating_sub(1),
+            );
+            let _ = queue!(terminal.backend_mut(), corner);
             let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
             self.field.set_lengths(&route_lengths);
             let drew_for = drawing.elapsed();

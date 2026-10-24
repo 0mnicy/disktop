@@ -43,9 +43,18 @@ const MIN_ROUTE_WIDTH: usize = 28;
 /// Distance between the dots that draw a track, in cells: far enough apart
 /// that the track is dotted and a dot's solid tail stands out on it.
 const TRACK_STEP: f64 = 1.0;
-/// How long each dot's dim tail is, in cells, and how finely it's drawn.
+/// Every flow's dotted track, faint like the panel borders, so what's
+/// moving along it stands out.
+const TRACK_COLOR: Color = Color::DarkGray;
+/// How long a dot's bright head is, and its dim tail behind that, in
+/// cells, and how finely they're drawn.
+const DOT_HEAD: f64 = 0.5;
 const DOT_TAIL: f64 = 1.5;
 const TAIL_STEP: f64 = 0.25;
+/// How far a dot's head spreads to either side of the route, in cells:
+/// enough to make it two braille dots thick against the one-dot track,
+/// across a cell's four rows or its two columns.
+const HEAD_SPREAD: Point = (0.25, 0.125);
 /// Arrowheads for each way a flow can run. From the old PC character set,
 /// so nearly every terminal font has them.
 const ARROW_RIGHT: char = '►';
@@ -74,6 +83,14 @@ const LINES: [char; 16] = [
 /// The graph's y-axis never shrinks below this, so an idle drive draws a flat
 /// line instead of magnifying a few bytes of noise.
 const MIN_GRAPH_SCALE: f64 = 64.0 * 1024.0;
+/// A graph's scale: the rate at its top, right-aligned in this many columns
+/// (wide enough for any of them, such as `500 MiB/s`), then an axis line.
+const SCALE_LABEL_WIDTH: u16 = 9;
+/// A graph gets a scale only when it's at least this tall, so the top and
+/// bottom labels are on different rows, and its plot still has this many
+/// columns beside it.
+const MIN_SCALED_GRAPH_ROWS: u16 = 2;
+const MIN_PLOT_WIDTH: u16 = 20;
 
 /// Draws the whole screen. Returns the on-screen length of each flow route,
 /// in the order of [`FlowField::routes`], so the engine knows where they end.
@@ -389,8 +406,49 @@ fn rate_span(name: &str, bytes_per_sec: f64, color: Color) -> Span<'static> {
 }
 
 /// The samples that fit in a graph: braille packs two into each column.
+/// As many recent samples as the graph's plot has braille columns.
 fn recent_samples(history: &History, graph: Rect) -> Vec<Rate> {
-    history.recent(usize::from(graph.width) * 2).collect()
+    let (_, plot) = scale_and_plot(graph);
+    history.recent(usize::from(plot.width) * 2).collect()
+}
+
+/// Splits a graph's area into its scale, when there's room for one, and
+/// the plot beside it.
+fn scale_and_plot(area: Rect) -> (Option<Rect>, Rect) {
+    let scale_width = SCALE_LABEL_WIDTH + 1;
+    if area.height < MIN_SCALED_GRAPH_ROWS || area.width < scale_width + MIN_PLOT_WIDTH {
+        return (None, area);
+    }
+    let [scale, plot] =
+        Layout::horizontal([Constraint::Length(scale_width), Constraint::Fill(1)]).areas(area);
+    (Some(scale), plot)
+}
+
+/// The rate at the top of a graph: the smallest round one, such as 50 MiB/s,
+/// a little above the busiest sample, so the scale reads at a glance.
+fn graph_top(samples: &[Rate]) -> f64 {
+    let wanted = (peak(samples) * 1.05).max(MIN_GRAPH_SCALE);
+    format::round_sizes()
+        .find(|&size| size >= wanted)
+        .unwrap_or(wanted)
+}
+
+/// A graph's scale: its top rate at the top, zero at the bottom, and an
+/// axis line between them, all dim so the graph stays the focus.
+fn draw_scale(frame: &mut Frame, area: Rect, top: f64) {
+    let width = usize::from(SCALE_LABEL_WIDTH);
+    let last = area.height.saturating_sub(1);
+    let lines: Vec<Line> = (0..area.height)
+        .map(|row| {
+            let text = match row {
+                0 => format!("{:>width$}┤", format!("{}/s", format::size_label(top))),
+                row if row == last => format!("{:>width$}┤", 0),
+                _ => format!("{:>width$}│", ""),
+            };
+            Line::from(text.dark_gray())
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn peak(samples: &[Rate]) -> f64 {
@@ -408,6 +466,12 @@ fn draw_graph(frame: &mut Frame, area: Rect, history: &History, samples: &[Rate]
         let waiting = Paragraph::new("collecting samples…").dark_gray().centered();
         frame.render_widget(waiting, area);
         return;
+    }
+
+    let top = graph_top(samples);
+    let (scale, area) = scale_and_plot(area);
+    if let Some(scale) = scale {
+        draw_scale(frame, scale, top);
     }
 
     // Right-align the samples so the newest one always sits at the right edge.
@@ -436,7 +500,7 @@ fn draw_graph(frame: &mut Frame, area: Rect, history: &History, samples: &[Rate]
             .data(&writes),
     ])
     .x_axis(Axis::default().bounds([0.0, window.saturating_sub(1) as f64]))
-    .y_axis(Axis::default().bounds([0.0, peak(samples).max(MIN_GRAPH_SCALE) * 1.15]));
+    .y_axis(Axis::default().bounds([0.0, top]));
 
     frame.render_widget(chart, area);
 }
@@ -477,9 +541,9 @@ fn plan_routes(
     board.plan(&ends)
 }
 
-/// Draws each flow's track as a dim dotted line and its dots in a bright
-/// color, each trailing a short solid tail in the dim one, so it points the
-/// way it's going.
+/// Draws each flow's track as a faint gray dotted line, and its dots as
+/// thick heads in the flow's bright color, each trailing a short thin tail
+/// in its dim one, so it points the way it's going.
 fn draw_dots(
     frame: &mut Frame,
     body: Rect,
@@ -487,8 +551,9 @@ fn draw_dots(
     plans: &[Option<layout::RoutePaths>],
 ) {
     let to_canvas = |(x, y): Point| (x - f64::from(body.x), f64::from(body.bottom()) - y);
-    let mut tracks: Vec<Vec<(f64, f64)>> = vec![Vec::new(); TRACK_COLORS.len()];
-    let mut dots: Vec<Vec<(f64, f64)>> = vec![Vec::new(); DOT_COLORS.len()];
+    let mut track: Vec<(f64, f64)> = Vec::new();
+    let mut tails: Vec<Vec<(f64, f64)>> = vec![Vec::new(); TRACK_COLORS.len()];
+    let mut heads: Vec<Vec<(f64, f64)>> = vec![Vec::new(); DOT_COLORS.len()];
 
     for (route, plan) in field.routes().iter().zip(plans) {
         let Some(plan) = plan else {
@@ -501,15 +566,14 @@ fn draw_dots(
         let (start, end) = track_span(route, plan.length());
         let mut s = (start / TRACK_STEP).ceil() * TRACK_STEP;
         while s <= end {
-            tracks[color].extend(plan.points_at(s, None).into_iter().map(to_canvas));
+            track.extend(plan.points_at(s, None).into_iter().map(to_canvas));
             s += TRACK_STEP;
         }
 
         for dot in route.dots() {
             let (head, tail) = comet(plan, dot);
-            dots[color].extend(head.into_iter().map(to_canvas));
-            // The tail is drawn with the track, in the dim color.
-            tracks[color].extend(tail.into_iter().map(to_canvas));
+            heads[color].extend(head.into_iter().map(to_canvas));
+            tails[color].extend(tail.into_iter().map(to_canvas));
         }
     }
 
@@ -518,19 +582,20 @@ fn draw_dots(
         .x_bounds([0.0, f64::from(body.width)])
         .y_bounds([0.0, f64::from(body.height)])
         .paint(|ctx| {
-            for (color, coords) in TRACK_COLORS.iter().zip(&tracks) {
-                ctx.draw(&Points {
-                    coords,
-                    color: *color,
-                });
-            }
-            // Heads go on their own layer so they replace what's under them.
-            ctx.layer();
-            for (color, coords) in DOT_COLORS.iter().zip(&dots) {
-                ctx.draw(&Points {
-                    coords,
-                    color: *color,
-                });
+            ctx.draw(&Points {
+                coords: &track,
+                color: TRACK_COLOR,
+            });
+            // Each layer replaces what's under it, so a tail covers the track
+            // and a head covers both.
+            for (layer, colors) in [(&tails, &TRACK_COLORS), (&heads, &DOT_COLORS)] {
+                ctx.layer();
+                for (color, coords) in colors.iter().zip(layer) {
+                    ctx.draw(&Points {
+                        coords,
+                        color: *color,
+                    });
+                }
             }
         });
     frame.render_widget(canvas, body);
@@ -640,7 +705,8 @@ fn arrowhead((dx, dy): Point) -> char {
     }
 }
 
-/// The points that draw a dot: its head, the front half cell, and its tail
+/// The points that draw a dot: its head, a thick blob at the front so it
+/// stands out from the thin track even on a short hop, and its thin tail
 /// behind that. The tail runs straight back and stops at the first bend,
 /// so on a route's short twisty legs, such as inside an array, it doesn't
 /// wrap around the corners into a lump.
@@ -649,24 +715,38 @@ fn comet(plan: &layout::RoutePaths, dot: &Dot) -> (Vec<Point>, Vec<Point>) {
     let straight_on = |heading: Point| fronts.iter().any(|&(_, front)| same_way(front, heading));
     let (mut head, mut tail) = (Vec::new(), Vec::new());
     let mut behind = 0.0;
-    while behind <= DOT_TAIL && dot.distance - behind >= 0.0 {
-        let points: Vec<Point> = plan
+    while behind <= DOT_HEAD + DOT_TAIL && dot.distance - behind >= 0.0 {
+        let points: Vec<(Point, Point)> = plan
             .headings_at(dot.distance - behind, Some(dot.id))
             .into_iter()
             .filter(|&(_, heading)| straight_on(heading))
-            .map(|(point, _)| point)
             .collect();
         if points.is_empty() {
             break;
         }
-        if behind < 0.5 {
-            head.extend(points);
+        if behind <= DOT_HEAD {
+            for ((x, y), heading) in points {
+                let (across_x, across_y) = across(heading);
+                let (spread_x, spread_y) = HEAD_SPREAD;
+                let (dx, dy) = (across_x * spread_x, across_y * spread_y);
+                head.extend([(x - dx, y - dy), (x + dx, y + dy)]);
+            }
         } else {
-            tail.extend(points);
+            tail.extend(points.into_iter().map(|(point, _)| point));
         }
         behind += TAIL_STEP;
     }
     (head, tail)
+}
+
+/// A unit step at right angles to `heading`.
+fn across((dx, dy): Point) -> Point {
+    let length = dx.hypot(dy);
+    if length > 0.0 {
+        (-dy / length, dx / length)
+    } else {
+        (0.0, 0.0)
+    }
 }
 
 /// Whether two headings point the same way.
@@ -1044,10 +1124,15 @@ mod tests {
         };
         let at = |distance| comet(&plan, &Dot { id: 0, distance });
 
-        // On a straight run, the whole tail.
+        // On a straight run, the whole tail, and a head spread a little to
+        // either side.
         let (head, tail) = at(5.0);
-        assert_eq!(head.len(), 2);
-        assert_eq!(tail.len(), 5);
+        assert_eq!(head.len(), 6);
+        assert!(
+            head.iter()
+                .all(|&(x, y)| x > 4.4 && y.abs() == HEAD_SPREAD.1)
+        );
+        assert_eq!(tail.len(), 6);
         assert!(tail.iter().all(|&(_, y)| y == 0.0));
 
         // Just round the corner, only the part below it.
@@ -1055,6 +1140,48 @@ mod tests {
         assert!(!head.is_empty());
         assert!(tail.iter().all(|&(x, y)| x == 10.0 && y > 0.0), "{tail:?}");
         assert!(tail.len() < 5);
+    }
+
+    #[test]
+    fn graphs_top_out_at_a_round_rate() {
+        let at = |mib: f64| {
+            let rate = mib * 1024.0 * 1024.0;
+            graph_top(&[Rate {
+                read: rate,
+                write: rate / 2.0,
+            }])
+        };
+        assert_eq!(at(40.0), 50.0 * 1024.0 * 1024.0);
+        assert_eq!(at(47.0), 50.0 * 1024.0 * 1024.0);
+        // Within a hair of the top it would touch it, so it goes up a step.
+        assert_eq!(at(48.0), 100.0 * 1024.0 * 1024.0);
+        assert_eq!(at(900.0), 1024.0 * 1024.0 * 1024.0);
+        // An idle disk keeps a small scale rather than magnifying noise.
+        assert_eq!(graph_top(&[]), 100.0 * 1024.0);
+    }
+
+    #[test]
+    fn graphs_show_their_scale() {
+        let mut terminal = Terminal::new(TestBackend::new(160, 60)).unwrap();
+        animate(&mut terminal, &mut demo_app_at(30.0), 1);
+        let lines = screen(&terminal);
+        let tops = lines
+            .iter()
+            .filter(|l| l.contains("iB/s┤") && !l.contains("read"))
+            .count();
+        let zeros = lines.iter().filter(|l| l.contains(" 0┤")).count();
+        assert!(tops >= 5 && zeros >= 5, "{tops} tops, {zeros} zeros");
+        // The scale is the same width on every graph, so they line up.
+        let axis_columns: std::collections::BTreeSet<usize> = lines
+            .iter()
+            .flat_map(|l| {
+                l.chars()
+                    .enumerate()
+                    .filter(|&(_, c)| c == '┤')
+                    .map(|(i, _)| i)
+            })
+            .collect();
+        assert!(axis_columns.len() <= 6, "{axis_columns:?}");
     }
 
     #[test]

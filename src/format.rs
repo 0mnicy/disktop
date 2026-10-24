@@ -51,6 +51,17 @@ pub fn size_label(value: f64) -> String {
     bytes(value).replace(".0 ", " ")
 }
 
+/// Round sizes, smallest first: 1, 2, 5, 10, 20, 50, 100, 200, 500 of each
+/// binary unit from KiB to TiB. Used for scales people read at a glance.
+pub fn round_sizes() -> impl Iterator<Item = f64> {
+    (1..=4).flat_map(|power| {
+        let unit = 1024f64.powi(power);
+        [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+            .into_iter()
+            .map(move |step| step * unit)
+    })
+}
+
 /// Parses a size such as `1M`, `512KiB`, `1.5g` or `4096`. Units are
 /// binary (`K` is 1024 bytes) to match how sizes are shown.
 pub fn parse_size(text: &str) -> Result<f64, String> {
@@ -89,6 +100,15 @@ mod tests {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * KIB;
     const GIB: f64 = 1024.0 * MIB;
+
+    #[test]
+    fn round_sizes_read_cleanly() {
+        let labels: Vec<String> = round_sizes().map(size_label).collect();
+        assert_eq!(labels[..4], ["1 KiB", "2 KiB", "5 KiB", "10 KiB"]);
+        assert!(labels.contains(&"500 MiB".to_string()));
+        assert!(labels.contains(&"1 GiB".to_string()));
+        assert!(labels.windows(2).all(|pair| pair[0] != pair[1]));
+    }
 
     #[test]
     fn small_values_stay_in_bytes() {
